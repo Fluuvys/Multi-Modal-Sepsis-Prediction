@@ -1,0 +1,27 @@
+name: sepsis-fusion
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - pandas=2.2.*
+  - pyarrow=16.*
+  - numpy=1.26.*
+  - duckdb=1.0.*        # fast querying of large local MIMIC-IV CSVs without full load
+  - scikit-learn=1.4.*
+  - pytorch=2.3.*
+  - torchvision=0.18.*
+  - pip
+  - pip:
+      - transformers==4.41.*   # BioBERT / Clinical-Longformer for notes encoders
+      - python-dotenv==1.0.*   # reads MIMIC_DATA_ROOT from .env
+      - pyyaml==6.0.*          # experiment configs
+
+# Setup (same for everyone):
+#   conda env create -f environment.yml
+#   conda activate sepsis-fusion
+#
+# If you add a new package: add it here with a pinned version, commit the change,
+# and tell the team to run `conda env update -f environment.yml --prune`.
+# Never `pip install` something ad hoc without adding it here -- that's exactly
+# how environments drift apart between teammates.
