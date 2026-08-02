@@ -49,11 +49,49 @@ it beats all baselines, then ablate SDCA/SARL against our own architecture. See
 
 ## 5. Task definition (locked — do not change without team discussion)
 
+**Cohort construction (filtering, applied BEFORE labeling):**
+- One ICU stay per patient — first eligible stay only, not all admissions
+- Adults only (age >= 18)
+- Minimum ICU length of stay (exclude very short stays, e.g. < 4-6h — not enough
+  time for a meaningful lead-time prediction task)
+- Exclude admissions where sepsis criteria are already met at/before ICU admission
+  (no "early prediction" possible for these — exclude, don't label positive)
+- Exclude admissions with insufficient chart/lab density to reliably compute SOFA
+- Split assignment is at the subject_id level, not hadm_id level — if a patient
+  somehow contributes more than one admission, ALL of that patient's admissions
+  go in the same split (never split across train/val/test for the same patient)
+
+**Task formulation (how predictions are actually made — locked, do not change without
+team discussion):**
+- **NOT** a fixed-window snapshot task (unlike MedFuse/FuseMoE/MedPatch's 48-IHM style).
+  This is a continuous, rolling early-warning task, following the standard framing used
+  by the PhysioNet 2019 Sepsis Challenge and Moor et al. (2019)'s GP-TCN paper.
+- A prediction timepoint is generated every hour per admission, starting after a short
+  observation/buffer period, stopping at sepsis onset or discharge for positive patients
+  (no timepoints generated after onset) -- following the exact setup used by SepsisCalc
+  and SepsisLab (both run hourly sliding predictions until diagnosis or discharge).
+- Single fixed prediction horizon W = 4 hours (matches SepsisCalc/SepsisLab directly,
+  a stronger and more specific precedent than the general PhysioNet Challenge
+  convention): label = 1 at timepoint t if onset occurs within the next 4h
+  (onset_time - t <= 4h), label = 0 otherwise. Negative (non-septic) patients are
+  label = 0 at every valid hourly timepoint across their stay.
+- ONE model is trained on this single task -- NOT four separately trained lead-time
+  models.
+- The 2h/4h/6h/12h lead-time sweep (Table 2 / Figure 3) is produced by stratifying test
+  predictions by TRUE distance-to-onset after training, not by training separate models.
+- This hourly expansion happens dynamically in the dataset/dataloader code at training
+  time (experiments/), NOT precomputed into sepsis_labels.parquet -- that file stays
+  admission-level as already defined in docs/data_schema.md.
+- Negative-timepoint subsampling during training is expected given severe class
+  imbalance at the timepoint level (worse than the patient-level positive rate) --
+  keep all positive timepoints, downsample negatives to a documented ratio.
+
+
 - Label: Sepsis-3 (suspicion of infection + SOFA score increase ≥2 within a −48h/+24h window)
 - Prediction task: early warning at lead times of **2h / 4h / 6h / 12h before onset**
 - Primary metrics: AUROC, AUPRC (AUPRC is primary given class imbalance), ECE for calibration
-- See `preprocessing/label_sepsis3.py` for the single source of truth on labeling — never
-  reimplement this logic elsewhere.
+- See `preprocessing/label_sepsis3.py` for the single source of truth on both cohort
+  construction and labeling — never reimplement this logic elsewhere.
 
 ## 6. Repo map (what lives where)
 
@@ -108,3 +146,11 @@ sepsis-repo/
    need a different definition, discuss with the team first, don't fork the logic silently.
 3. Ablations (Table 3) are performed against **our own architecture**, not a baseline's.
 4. Don't merge to `main` without a reviewed PR — see `CONTRIBUTING.md`.
+5. **Every model — every baseline reproduction AND our own architecture — consumes data
+   from the SAME `preprocessing/` pipeline.** Never let a baseline bring its own separate
+   extraction/normalization code (e.g. MedPatch's `mimic4extract/`, FuseMoE's own scripts).
+   If you find yourself copying a baseline's preprocessing wholesale instead of adapting its
+   logic into our shared pipeline, stop — this breaks the fairness of every comparison in
+   Table 2. It's fine (encouraged) to reference a baseline's variable set, normalization, or
+   split-alignment conventions when building our shared pipeline — just build it once, here,
+   for everyone.
