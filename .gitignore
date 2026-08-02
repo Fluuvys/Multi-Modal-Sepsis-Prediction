@@ -1,0 +1,18 @@
+# data (never commit raw patient data)
+data/cohort/*
+!data/cohort/.gitkeep
+data/raw_links/*.env
+*.parquet
+*.csv
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.env
+
+# results (keep versioned metrics, not raw weights)
+*.pt
+*.pth
+*.ckpt
