@@ -20,101 +20,58 @@ INPUT:  raw MIMIC-IV chartevents/labevents (see data/raw_links/)
 OUTPUT: data/cohort/ehr_timeseries/ (one file per admission, or a single long-format
         file -- decide and document here once implemented)
 """
-
-# TODO: implementation goes here
 """
 preprocessing/ehr_extraction.py
+================================================================================
+PURPOSE:
+    Extract the irregular EHR time-series (vitals + labs) per admission from MIMIC-IV,
+    preserving exact observation timestamps. Per PROJECT_CONTEXT.md Rule #5, NO 
+    model-specific reduction (e.g., hourly binning) happens here. SDCA needs real 
+    elapsed-time values downstream.
 
-Extracts the irregular EHR time-series (17 standard vitals+labs variables) per
-admission from local MIMIC-IV v3.1 CSVs, joins against the Sepsis-3 cohort
-produced in Milestone 0, and writes the shared, unbinned, long-format
-data/cohort/ehr_timeseries.parquet consumed by every baseline (models/baselines/)
-and our own model (models/ours/). Per PROJECT_CONTEXT.md Rule #5, NO model-specific
-reduction (e.g. hourly binning) happens here -- that belongs in each model's adapter.
+TWO STAGES, KEPT AS SEPARATE FUNCTIONS INTERNALLY:
+    Stage A -- extract_raw_events(): Connects to raw MIMIC-IV tables, extracts the 
+               standard 17-variable set (5 categorical + 12 continuous), and applies 
+               variable-specific cleaning/normalization.
+    Stage B -- align_and_format(): Inner-joins against the Sepsis-3 cohort, derives 
+               missing composite variables (e.g., GCS total), and computes the 
+               critical 'hours_before_onset' column.
 
--------------------------------------------------------------------------------
-VARIABLE SET, NAMING & CLEANING -- READ BEFORE EDITING
--------------------------------------------------------------------------------
-Variable set: the standard 17-variable set introduced by Harutyunyan et al. 2019
-("Multitask learning and benchmarking with clinical time series data"), which
-MedFuse/MedPatch's mimic4extract/ builds on (a port of mimic3benchmark to
-MIMIC-IV MetaVision itemids). 5 categorical + 12 continuous, matching the issue.
+REFERENCE IMPLEMENTATIONS:
+    - nyuad-cai/MedPatch (mimic4extract/ and ehr_utils/) for the standard 17-variable 
+      set mapping and cleaning functions.
 
-VARIABLE NAMES: confirmed from mimic4extract/ehr_utils/preprocessing.py
-(read_itemid_to_variable_map / clean_fns), which you pasted in. The map file
-groups itemids under a 'LEVEL2' column with Title Case names, e.g.
-'Diastolic blood pressure', 'Capillary refill rate'. We use those exact
-strings as `variable_name` values (not snake_case) specifically so this
-output is trivially comparable/joinable with MedFuse/MedPatch conventions.
+TODO checklist (Milestone 1 — EHR preprocessing pipeline):
+    [x] Pull the standard 17-variable set matching MedFuse/MedPatch convention
+    [x] Keep raw timestamps, no fixed-interval resampling
+    [x] Output one long-format time-series object, aligned to sepsis_labels.parquet
+    [x] Compute hours_before_onset for SDCA
+    [x] Add per-variable coverage stats and a spot-check utility
 
-PROVENANCE / STILL MISSING: the actual itemid->variable mapping lives in
-mimic4extract/resources/itemid_to_variable_map.csv, and valid/outlier ranges
-in resources/variable_ranges.csv -- neither file's contents were provided to
-me, and I have no working internet access in this session (GitHub also blocks
-automated scraping via robots.txt). VARIABLE_ITEMID_MAP below is therefore
-still my best-effort MIMIC-IV MetaVision itemid list (same one as before),
-NOT copied from your actual resources/itemid_to_variable_map.csv.
-ACTION ITEM: if you can paste resources/itemid_to_variable_map.csv and
-resources/variable_ranges.csv (they're small CSVs), I can replace
-VARIABLE_ITEMID_MAP with the verified itemids and wire in real outlier
-clipping instead of the placeholder below. Until then, diff this list
-yourself against that file before trusting it for the paper, and note any
-corrections in the PR description per the issue's requirement to list exact
-itemids used.
+================================================================================
+ASSUMPTIONS / DEVIATIONS FLAGGED FOR TEAM REVIEW — read before trusting output
+================================================================================
+A1. VARIABLE MAPPING PROVENANCE: The exact itemid->variable mapping and outlier 
+    ranges from MedPatch (itemid_to_variable_map.csv, variable_ranges.csv) were 
+    not fully provided. VARIABLE_ITEMID_MAP is a best-effort MetaVision mapping. 
+    OUTLIER_RANGES is currently empty. The team must wire in the real ranges from 
+    the CSV before final modeling.
 
-CLEANING LOGIC: ported from the clean_fns you pasted (clean_crr, clean_sbp,
-clean_dbp, clean_fio2, clean_o2sat, clean_lab, clean_temperature,
-clean_weight, clean_height), operating on MIMIC-IV chartevents/labevents
-columns (value, valuenum, valueuom) instead of MIMIC-III's. See CLEAN_FNS
-below for the per-variable mapping; anything not in CLEAN_FNS (Heart Rate,
-Respiratory rate, Mean blood pressure, the 3 raw GCS sub-scores) is used as
-valuenum with no special-case cleaning, matching the reference.
+A2. GCS TOTAL DERIVATION: MIMIC-IV MetaVision lacks a pre-computed "GCS total" 
+    itemid. It is derived dynamically here (eye + motor + verbal) only for rows 
+    where all three components share the exact same timestamp. Partial charting 
+    is ignored, which will reflect as a slight coverage loss.
 
-OUT OF SCOPE FOR THIS FILE (per PROJECT_CONTEXT.md Rule #5 and the repo map):
-  - Discretizer / Normalizer (fixed-timestep binning, z-score normalization)
-    from the preprocessing.py you pasted are model-specific reductions and
-    belong in each model's own adapter under models/baselines/<name>/ or
-    models/ours/, NOT here. This file only ever produces raw, unbinned,
-    long-format observations.
-  - create_split.py (linking CXR splits to EHR admission splits) is a
-    cohort/split-construction concern, not EHR feature extraction -- that
-    logic belongs with data/splits/ or preprocessing/cxr_linking.py, not here.
+A3. UNIT CONVERSIONS: Temperature (F to C), FiO2 (pct to fraction), Weight 
+    (oz/lb to kg), Height (in to cm) apply heuristics from MedPatch. Blood 
+    pressure parsing handles legacy "120/80" string artifacts. 'Capillary refill 
+    rate' strings are strictly mapped to 0.0/1.0; unrecognized strings are dropped.
 
-GCS TOTAL NOTE: MIMIC-IV MetaVision has no single "GCS total" chartevents
-itemid (that existed only in the legacy CareVue system, which MIMIC-IV does
-not include). Even though 'Glascow coma scale total' appears as a LEVEL2
-name in the reference map (it's valid for MIMIC-III/CareVue data), for our
-MIMIC-IV-only cohort we derive it: gcs_total = eye + motor + verbal for rows
-where all three components share the same (hadm_id, timestamp) -- MetaVision
-nurses chart all three simultaneously in the vast majority of cases. Rows
-with only partial components at a given timestamp do NOT get a derived
-total; this shows up as coverage loss in the summary stats.
-
-UNIT CONVERSION / DUPLICATE-ITEMID ASSUMPTIONS (flagged per issue requirement,
-see CLEAN_FNS for the actual logic):
-  - Temperature: converted to Celsius whenever valueuom mentions 'F' or the
-    raw value looks like an unlabeled Fahrenheit reading (>=79), mirroring
-    clean_temperature's heuristic exactly.
-  - FiO2: divided by 100 to normalize to a 0-1 fraction unless valueuom says
-    'torr' (a different unit entirely) -- mirrors clean_fio2. NOTE: MIMIC-IV
-    chartevents' valueuom field may not carry 'torr' the same way MIMIC-III's
-    did; spot-check this against real rows.
-  - Oxygen saturation: values already on a 0-1 scale get rescaled to 0-100.
-  - Weight: oz -> lb -> kg cascade driven by valueuom, mirrors clean_weight.
-  - Height: in -> cm driven by valueuom, mirrors clean_height.
-  - Systolic/diastolic BP: if a raw value string looks like "120/80" (some
-    legacy combined-entry quirk), the correct half is parsed out via regex
-    before falling back to valuenum -- mirrors clean_sbp/clean_dbp.
-  - Glucose / pH: non-numeric raw values (e.g. "ERROR") are dropped rather
-    than coerced, mirrors clean_lab.
-  - Capillary refill rate: 'Normal <3 secs'/'Brisk' -> 0.0,
-    'Abnormal >3 secs'/'Delayed' -> 1.0, anything else -> dropped. Mirrors
-    clean_crr exactly (note: this is slightly stricter than a generic
-    "starts with normal" check -- unrecognized strings are now dropped, not
-    silently coded as abnormal).
-  - No outlier clipping (variable_ranges.csv OUTLIER_LOW/HIGH, VALID_LOW/HIGH)
-    is applied yet -- placeholder OUTLIER_RANGES = {} below. Wire in the real
-    ranges once you can share resources/variable_ranges.csv.
+A4. OUT OF SCOPE (By Design): Discretizer / Normalizer (fixed-timestep binning, 
+    z-score normalization) are intentionally excluded here per Context Rule #5. 
+    This file only ever produces raw, unbinned, long-format observations. Model 
+    adapters handle binning downstream.
+================================================================================
 """
 
 import argparse

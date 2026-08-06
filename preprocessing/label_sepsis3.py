@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 label_sepsis3.py
 
@@ -194,7 +195,7 @@ A11. Renal urine-output validity (`hr >= 18` in _score_sofa_components) is a
 ================================================================================
 """
 
-from __future__ import annotations
+
 
 import argparse
 import json
