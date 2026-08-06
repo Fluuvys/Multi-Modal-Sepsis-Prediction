@@ -47,7 +47,7 @@ TODO checklist (Milestone 1 — EHR preprocessing pipeline):
     [x] Output one long-format time-series object, aligned to sepsis_labels.parquet
     [x] Compute hours_before_onset for SDCA
     [x] Add per-variable coverage stats and a spot-check utility
-
+    [ ] Team sign-off on the ASSUMPTION items below before this is truly "locked"
 ================================================================================
 ASSUMPTIONS / DEVIATIONS FLAGGED FOR TEAM REVIEW — read before trusting output
 ================================================================================
