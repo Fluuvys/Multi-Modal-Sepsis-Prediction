@@ -139,30 +139,73 @@ architecture. See `docs/gap_and_solution.md` for the full explanation.
 
 ## 7. Task definition (locked — do not change without team discussion)
 
+**STATUS: Milestone 0 (cohort lock) is CLOSED as of the full-cohort run below.
+`ehr_extraction.py` / `notes_extraction.py` / `cxr_linking.py` may now key off
+`data/cohort/sepsis_labels.parquet` as a stable, final artifact.**
+
 **Cohort construction (filtering, applied BEFORE labeling) — see `preprocessing/label_sepsis3.py`:**
 - One ICU stay per patient — first eligible stay only, not all admissions
 - Adults only (age >= 18)
 - Minimum ICU length of stay (>= 12h)
-- Exclude admissions with insufficient chart/lab density (`MIN_VALID_OBS_HOURS`, currently
-  configurable via `--min_valid_obs_hours`, default 5 raw hours per the task spec; SepsisCalc's
-  own precedent, once corrected for their 3h binning, corresponds to ~15 raw hours — an
-  explicit team decision, not silently baked in)
-- Exclude admissions where sepsis criteria are already met at/before ICU admission
-  (`excluded_reason = "sepsis_at_admission"`: suspicion_time <= intime AND hr=0 absolute
-  SOFA >= 2) — no "early prediction" possible for these
-- Split assignment is at the subject_id level, not hadm_id level — if a patient somehow
-  contributes more than one admission, ALL of that patient's admissions go in the same split
+- Exclude admissions with insufficient chart/lab density (`MIN_VALID_OBS_HOURS`,
+  default 5 raw hours — matches SepsisCalc's own precedent exactly, confirmed
+  by direct inspection of their code; see A8/A8.1)
+- **Exclude admissions where sepsis onset occurs within 4 hours of ICU admission**
+  (`excluded_reason = "sepsis_within_4h_of_admission"`) — chosen for consistency
+  with our own locked 4-hour rolling prediction horizon (SepsisCalc/SepsisLab),
+  and supported by literature precedent for excluding early-onset cases as
+  unsuitable for an early-*prediction* task (arXiv:2210.15056 uses 6h;
+  arXiv:2511.08986 uses 6h; we use 4h for internal task consistency — see
+  ASSUMPTION A10 for full citation trail)
+- Split assignment is at the subject_id level, not hadm_id level
 
-**Labeling (Sepsis-3):**
-- Suspicion of infection: earlier of (first antibiotic, first culture), valid only if the
-  other event follows within 24h (antibiotics->cultures) or 72h (cultures->antibiotics)
-- Sepsis onset: first time total SOFA increases by >=2 relative to baseline (SOFA at hr=0),
-  within a -48h/+24h window around suspicion of infection
-- Missing SOFA component -> assume healthy (0 points): operationalized as worst value in a
-  trailing 24h window, coalesced to 0 only if nothing was observed in that window at all
-- Reference implementations cross-checked (do not invent a new definition from scratch):
-  MIT-LCP/mimic-code (`concepts/sepsis/`), alistairewj/sepsis3-mimic, yinchangchang/SepsisCalc
-  (hours-since-admission alignment pattern; NOT their 3h binning — we use raw timestamps)
+**Labeling (Sepsis-3) — baseline convention LOCKED after a real definitional
+fork, documented here so it is never silently re-litigated:**
+- Suspicion of infection: earlier of (first antibiotic, first culture), valid
+  only if the other event follows within 24h (antibiotics->cultures) or 72h
+  (cultures->antibiotics)
+- **Baseline SOFA = the MEASURED SOFA value at hr=0** (NOT a fixed 0). This
+  matches Moor et al. (2019) / "AI Gone Astray" (arXiv:2203.16452) — our
+  project's own cited precedent for the -48h/+24h onset window — rather than
+  mimic-code's generic fixed-0 convention. This was a deliberate, considered
+  choice for internal consistency with our own cited task framing, made after
+  discovering the fork; do not silently revert to fixed-0.
+- Sepsis onset: first time total SOFA increases by >=2 relative to that
+  baseline, within a -48h/+24h window around suspicion of infection
+- Missing SOFA component -> assume healthy (0 points): worst value in a
+  trailing 24h window, coalesced to 0 only if nothing observed in that window
+- Reference implementations cross-checked: MIT-LCP/mimic-code (faithful SQL
+  port for SOFA components: bg.sql, gcs.sql, ventilator_setting.sql,
+  oxygen_delivery.sql, urine_output_rate.sql, norepinephrine.sql — verified
+  against live source, not reconstructed from description),
+  alistairewj/sepsis3-mimic, yinchangchang/SepsisCalc
+
+**KNOWN, DOCUMENTED LIMITATION (evidence-based, not a bug — do not "fix" this
+without discussing first):** a hand-traced spot-check of 3 positive patients
+(onset hours 6-8) found that in all 3 cases, the SOFA component driving the
+detected onset hour was that component's FIRST-EVER measurement in the stay,
+not a measured decline from an earlier value. This means `sepsis_onset_time`
+is more precisely "the time charted data first crossed the Sepsis-3
+threshold," not necessarily "the time the patient's physiology first crossed
+it." This is the accepted, documented behavior of the same convention our
+cited precedent (Moor et al.) uses, not an implementation defect. FOLLOW-UP
+(not blocking): quantify at full cohort scale (currently n=3 spot-check only)
+— flag, for all 11,694 positive labels, whether the onset-driving component(s)
+had any prior non-null observation earlier in the same stay, report the
+resulting percentage in the paper's limitations section.
+
+**Final locked cohort statistics (full MIMIC-IV run, `--sample_size` unset):**
+- 65,366 first-eligible-stay candidates -> 52,560 in final cohort (19.59% excluded)
+- Exclusions: sepsis_within_4h_of_admission 15.85%, los_under_12h 3.74%,
+  insufficient_observation_density 0.00% (1 admission)
+- **Sepsis positive rate: 22.25%** (train 22.09%, val 23.06%, test 22.21% —
+  max split gap 0.97 pts, well-balanced)
+- n_unique_subject_ids == n_unique_hadm_ids == 52,560 (confirms first-stay
+  filter and split logic both correct at full scale)
+- Hours from admission to onset (positive patients, n=11,694): median 9.0h,
+  IQR 6.0-18.0h (25th percentile comfortably clear of the 4h exclusion
+  boundary — confirms the exclusion fixed the underlying issue rather than
+  just relocating it)
 
 **Task formulation (how predictions are actually made):**
 - NOT a fixed-window snapshot task (unlike MedFuse/FuseMoE/MedPatch's 48-IHM style). This is
@@ -225,9 +268,16 @@ sepsis-repo/
 ## 9. Current status
 > Update this section every week so everyone (and every AI assistant) knows what's done.
 
-- [x] Cohort construction / Sepsis-3 labeling (`label_sepsis3.py` — bugs found + fixed via
-      team review: dead-code sepsis_at_admission check, GCS convention, vectorized SOFA
-      scoring, min_valid_obs_hours ambiguity resolved as an explicit flag)
+- [x] Cohort construction / Sepsis-3 labeling — CLOSED on full-cohort run.
+      52,560 patients, 22.25% positive, well-balanced splits. Bugs found +
+      fixed via team review: dead-code sepsis_at_admission check (replaced
+      with 4h buffer exclusion), GCS convention verified against live source,
+      vectorized SOFA scoring, min_valid_obs_hours resolved, baseline-SOFA
+      convention fork resolved (measured hr=0, matching Moor et al.). One
+      documented, non-blocking limitation: onset timing reflects
+      first-charted-measurement, not necessarily true physiological onset —
+      see Section 7. Follow-up task (not blocking): quantify this at full
+      cohort scale for the paper's limitations section.
 - [ ] EHR/notes/CXR preprocessing pipelines
 - [ ] Step 0 signal-verification diagnostic (Section 3) — MUST pass before Module 1/2 build
 - [ ] Baseline reproductions (MedFuse / FuseMoE / MedPatch / DrFuse)
