@@ -58,9 +58,15 @@ A1. VARIABLE MAPPING PROVENANCE: The exact itemid->variable mapping and outlier
     the CSV before final modeling.
 
 A2. GCS TOTAL DERIVATION: MIMIC-IV MetaVision lacks a pre-computed "GCS total" 
-    itemid. It is derived dynamically here (eye + motor + verbal) only for rows 
-    where all three components share the exact same timestamp. Partial charting 
-    is ignored, which will reflect as a slight coverage loss.
+    itemid. Derived in _derive_gcs_total(), a faithful port of mimic-code's 
+    measurement/gcs.sql (matching the same logic already used in 
+    label_sepsis3.py's SOFA CNS component, PB3). Handles two MIMIC-IV-specific 
+    quirks: (1) intubated patients charted as verbal="No Response-ETT" get 
+    verbal remapped to 0 and total forced to 15, rather than penalized as a 
+    real low verbal score; (2) a missing component can carry forward from the 
+    previous reading within 6h, componentwise, rather than requiring exact-
+    timestamp completeness for all three. Verified against a synthetic 
+    4-branch test case before merge.
 
 A3. UNIT CONVERSIONS: Temperature (F to C), FiO2 (pct to fraction), Weight 
     (oz/lb to kg), Height (in to cm) apply heuristics from MedPatch. Blood 
@@ -72,6 +78,13 @@ A4. OUT OF SCOPE (By Design): Discretizer / Normalizer (fixed-timestep binning,
     This file only ever produces raw, unbinned, long-format observations. Model 
     adapters handle binning downstream.
 ================================================================================
+python preprocessing/ehr_extraction.py \
+  --data_root "/home/fluuvys-main/Research/Multi modal sepsis prediction/Data/mimic-iv-3.1" \
+  --labels_path data/cohort/sepsis_labels.parquet \
+  --output data/cohort/ehr_timeseries_sample.parquet \
+  --sample_size 50
+
+
 """
 
 import argparse
@@ -101,7 +114,10 @@ VARIABLE_ITEMID_MAP = {
         (220051, "chartevents", "arterial line, mmHg"),
         (220180, "chartevents", "non-invasive cuff, mmHg"),
     ],
-    "Fraction inspired oxygen": [(223835, "chartevents", "may be pct or fraction; see CLEAN_FNS")],
+    "Fraction inspired oxygen": [
+        (223835, "chartevents", "may be pct or fraction; see CLEAN_FNS"),
+        (50816, "labevents", "drawn as part of blood gas panel; may be pct or fraction; see CLEAN_FNS"),
+    ],
     "Glucose": [
         (220621, "chartevents", "serum glucose, mg/dL"),
         (225664, "chartevents", "fingerstick glucose, mg/dL"),
@@ -264,6 +280,19 @@ def extract_raw_events(data_root: Path, sample_hadm_ids=None) -> pd.DataFrame:
     raw = pd.concat([chart_df, lab_df], ignore_index=True)
     raw["variable_name"] = raw["itemid"].map(itemid_to_varname)
     raw = raw.dropna(subset=["variable_name", "timestamp"])
+
+    # Dedup: MIMIC-IV mirrors some lab results into chartevents at the exact
+    # same timestamp with the exact same value (e.g. pH itemid 50820 in
+    # labevents gets echoed as itemid 223830 in chartevents for bedside
+    # display). Since VARIABLE_ITEMID_MAP maps multiple itemids to the same
+    # variable_name, these survive as duplicate rows unless collapsed here.
+    # This only removes EXACT (timestamp, value) matches within the same
+    # variable -- two genuinely different readings at the same timestamp
+    # (e.g. a serum glucose and a fingerstick glucose that happen to differ)
+    # are left alone.
+    before = len(raw)
+    raw = raw.drop_duplicates(subset=["hadm_id", "timestamp", "variable_name", "valuenum"], keep="first")
+    print(f"  deduped {before - len(raw):,} exact-match rows across chartevents/labevents mirrors")
     raw["hadm_id"] = raw["hadm_id"].astype("int64")
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
     raw["valueuom"] = raw["valueuom"].fillna("")
@@ -291,9 +320,9 @@ _BP_PAIR_RE = re.compile(r"^(\d+)/(\d+)$")
 def _clean_crr(df: pd.DataFrame) -> pd.Series:
     v = pd.Series(np.nan, index=df.index)
     text = df["value_text"].str.strip()
-    v.loc[text.isin(["Normal <3 secs", "Brisk"])] = 0.0
-    v.loc[text.isin(["Abnormal >3 secs", "Delayed"])] = 1.0
-    return v  # anything else (unrecognized strings) stays NaN -> dropped
+    v.loc[text.isin(["Normal <3 Seconds", "Brisk"])] = 0.0
+    v.loc[text.isin(["Abnormal >3 Seconds", "Delayed"])] = 1.0
+    return v
 
 
 def _clean_bp_pair(df: pd.DataFrame, group: int) -> pd.Series:
@@ -360,6 +389,19 @@ def _clean_height(df: pd.DataFrame) -> pd.Series:
     v.loc[is_in] = np.round(v.loc[is_in] * 2.54)
     return v
 
+def _clean_gcs_verbal(df: pd.DataFrame) -> pd.Series:
+    """
+    Maps MIMIC-IV's 'No Response-ETT' (intubated, verbal unassessable) to 0,
+    matching the convention verified against mimic-code's gcs.sql and already
+    used in label_sepsis3.py's SOFA CNS component (PB3). This 0 is a sentinel
+    consumed by _derive_gcs_total() below, NOT a real "worst possible verbal
+    score" to be used on its own.
+    """
+    v = df["valuenum"].astype(float).copy()
+    is_ett = df["value_text"].str.strip() == "No Response-ETT"
+    v.loc[is_ett] = 0.0
+    return v
+
 
 CLEAN_FNS = {
     "Capillary refill rate": _clean_crr,
@@ -372,6 +414,7 @@ CLEAN_FNS = {
     "Temperature": _clean_temperature,
     "Weight": _clean_weight,
     "Height": _clean_height,
+    "Glascow coma scale verbal response": _clean_gcs_verbal,
     # Not in CLEAN_FNS (used as valuenum directly, no special handling),
     # matching the reference: Heart Rate, Respiratory rate,
     # Mean blood pressure, and the 3 raw GCS sub-scores.
@@ -386,7 +429,96 @@ def _clean_events(raw: pd.DataFrame) -> pd.Series:
             value.loc[idx] = fn(raw.loc[idx])
     return value
 
+def _derive_gcs_total(events: pd.DataFrame) -> pd.DataFrame:
+    """
+    Faithful port of label_sepsis3.py's PB3 GCS-total logic (itself a port of
+    mimic-code's measurement/gcs.sql), applied at the hadm_id grain instead
+    of stay_id -- equivalent for this cohort, since build_cohort() already
+    restricts to exactly one ICU stay per admission.
 
+    Unlike the PREVIOUS version of this function (which required all three
+    components at the EXACT same timestamp, dropping every partial-charting
+    row), this ports mimic-code's carry-forward rule: a component missing at
+    the current timestamp can use the PREVIOUS charted value of that same
+    component, as long as that previous reading is within 6h. This changes
+    both coverage (more rows now qualify) and correctness (intubated
+    patients no longer get penalized for an unassessable verbal component).
+
+    Branch logic (verbatim from gcs.sql / PB3), b = current row, b2 = the
+    previous row (within 6h) for the same hadm_id:
+      1. b.verbal == 0 (current row itself is "No Response-ETT",
+         pre-mapped to 0 by _clean_gcs_verbal)               -> total = 15
+      2. b.verbal IS NULL AND b2.verbal == 0                 -> total = 15
+      3. b2.verbal == 0 (and b.verbal is real, non-null/non-zero)
+         -> total = COALESCE(b.motor,6) + COALESCE(b.verbal,5) + COALESCE(b.eyes,4)
+            (current row's own components only -- a fresh non-ETT verbal
+            reading is trusted immediately, no b2 fallback)
+      4. otherwise (normal carry-forward, componentwise)
+         -> total = COALESCE(b.motor, COALESCE(b2.motor,6))
+                   + COALESCE(b.verbal, COALESCE(b2.verbal,5))
+                   + COALESCE(b.eyes, COALESCE(b2.eyes,4))
+    """
+    gcs_component_names = [
+        "Glascow coma scale eye opening",
+        "Glascow coma scale motor response",
+        "Glascow coma scale verbal response",
+    ]
+    gcs_components = events[events["variable_name"].isin(gcs_component_names)]
+    if gcs_components.empty:
+        return pd.DataFrame(columns=["hadm_id", "timestamp", "variable_name", "value"])
+
+    pivoted = gcs_components.pivot_table(
+        index=["hadm_id", "timestamp"],
+        columns="variable_name",
+        values="value",
+        aggfunc="first",
+    ).reset_index()
+    for c in gcs_component_names:
+        if c not in pivoted.columns:
+            pivoted[c] = np.nan
+    pivoted = pivoted.rename(columns={
+        "Glascow coma scale eye opening": "eyes",
+        "Glascow coma scale motor response": "motor",
+        "Glascow coma scale verbal response": "verbal",
+    })
+    pivoted = pivoted.sort_values(["hadm_id", "timestamp"]).reset_index(drop=True)
+
+    grp = pivoted.groupby("hadm_id")
+    pivoted["motor_prev"] = grp["motor"].shift(1)
+    pivoted["verbal_prev"] = grp["verbal"].shift(1)
+    pivoted["eyes_prev"] = grp["eyes"].shift(1)
+    prev_timestamp = grp["timestamp"].shift(1)
+    within_6h = (pivoted["timestamp"] - prev_timestamp) <= pd.Timedelta(hours=6)
+    # matches gcs.sql's b2 JOIN condition exactly: outside 6h, treat as absent
+    pivoted.loc[~within_6h.fillna(False), ["motor_prev", "verbal_prev", "eyes_prev"]] = np.nan
+
+    b_verbal = pivoted["verbal"]
+    b2_verbal = pivoted["verbal_prev"]
+
+    branch1 = b_verbal == 0
+    branch2 = b_verbal.isna() & (b2_verbal == 0)
+    branch3 = (~branch1) & (~branch2) & (b2_verbal == 0)
+    # branch4 = everything else (default)
+
+    total_branch1_2 = pd.Series(15.0, index=pivoted.index)
+    total_branch3 = (
+        pivoted["motor"].fillna(6) + pivoted["verbal"].fillna(5) + pivoted["eyes"].fillna(4)
+    )
+    total_branch4 = (
+        pivoted["motor"].fillna(pivoted["motor_prev"]).fillna(6)
+        + pivoted["verbal"].fillna(pivoted["verbal_prev"]).fillna(5)
+        + pivoted["eyes"].fillna(pivoted["eyes_prev"]).fillna(4)
+    )
+
+    gcs_total = pd.Series(np.nan, index=pivoted.index, dtype="float64")
+    gcs_total = gcs_total.mask(branch1 | branch2, total_branch1_2)
+    gcs_total = gcs_total.mask(branch3, total_branch3)
+    gcs_total = gcs_total.mask(gcs_total.isna(), total_branch4)
+
+    out = pivoted[["hadm_id", "timestamp"]].copy()
+    out["variable_name"] = "Glascow coma scale total"
+    out["value"] = gcs_total
+    return out
 # ------------------------------------------------------------------------------
 # 3. STAGE B -- align_and_format
 # ------------------------------------------------------------------------------
@@ -408,28 +540,12 @@ def align_and_format(raw_events: pd.DataFrame, cohort_labels: pd.DataFrame) -> p
 
     events = raw_events.copy()
 
-    # --- derive "Glascow coma scale total" from simultaneous eye+motor+verbal charttimes ---
-    gcs_component_names = [
-        "Glascow coma scale eye opening",
-        "Glascow coma scale motor response",
-        "Glascow coma scale verbal response",
-    ]
-    gcs_components = events[events["variable_name"].isin(gcs_component_names)]
-    if not gcs_components.empty:
-        pivoted = gcs_components.pivot_table(
-            index=["hadm_id", "timestamp"],
-            columns="variable_name",
-            values="value",
-            aggfunc="first",
-        )
-        complete = pivoted.dropna(subset=gcs_component_names)
-        if not complete.empty:
-            gcs_total_col = sum(complete[c] for c in gcs_component_names).reset_index(name="value")
-            gcs_total_col["variable_name"] = "Glascow coma scale total"
-            events = pd.concat(
-                [events, gcs_total_col[["hadm_id", "timestamp", "variable_name", "value"]]],
-                ignore_index=True,
-            )
+    # --- derive "Glascow coma scale total" (see _derive_gcs_total for the
+    #     full carry-forward/intubation-aware logic, ported from
+    #     label_sepsis3.py's PB3 / mimic-code's gcs.sql) ---
+    gcs_total_rows = _derive_gcs_total(events)
+    if not gcs_total_rows.empty:
+        events = pd.concat([events, gcs_total_rows], ignore_index=True)
 
     # --- inner join against cohort ---
     cohort = cohort_labels[["hadm_id", "sepsis_onset_time"]].copy()
@@ -545,7 +661,15 @@ def main():
         )
         sys.exit(1)
 
-    sample_hadm_ids = None
+    # BUG FIX: sample_hadm_ids used to be None whenever --sample_size wasn't
+    # passed, which meant extract_raw_events() got no hadm_id filter at all
+    # on a full run -- it scanned/extracted matching-itemid rows for the
+    # ENTIRE hospital population, not just this cohort, and only discarded
+    # the excess afterward in Stage B's join. Now it's ALWAYS derived from
+    # cohort_labels: the full cohort by default, or a random subset of it
+    # when --sample_size is set. sample_hadm_ids is never None again, so
+    # extract_raw_events() always receives a real, correct filter.
+    all_cohort_hadm_ids = cohort_labels["hadm_id"].drop_duplicates().tolist()
     if args.sample_size is not None:
         sample_hadm_ids = (
             cohort_labels["hadm_id"].drop_duplicates().sample(
@@ -554,16 +678,16 @@ def main():
             ).tolist()
         )
         print(f"--sample_size set: restricting to {len(sample_hadm_ids)} hadm_ids for this run.")
+    else:
+        sample_hadm_ids = all_cohort_hadm_ids
+        print(f"No --sample_size: extracting for the full cohort ({len(sample_hadm_ids):,} hadm_ids).")
 
     print("Stage A: extracting raw events from chartevents/labevents ...")
     raw_events = extract_raw_events(data_root, sample_hadm_ids=sample_hadm_ids)
     print(f"  extracted {len(raw_events):,} raw observation rows.")
 
     print("Stage B: joining against cohort and computing hours_before_onset ...")
-    cohort_for_join = (
-        cohort_labels[cohort_labels["hadm_id"].isin(sample_hadm_ids)]
-        if sample_hadm_ids is not None else cohort_labels
-    )
+    cohort_for_join = cohort_labels[cohort_labels["hadm_id"].isin(sample_hadm_ids)]
     final_df = align_and_format(raw_events, cohort_for_join)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
