@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 preprocessing/notes_extraction.py
 ================================================================================
@@ -87,26 +88,35 @@ A1. Our OUTPUT note_type ('RR'/'DN') is derived from WHICH SOURCE TABLE a row
     code -- see A8), it's still a discharge note for our purposes. The raw
     note_type values actually observed per source table are logged to
     notes_stats.json ("raw_note_type_observed_by_source_table") so the team
-    can confirm nothing unexpected is hiding in there.
+    can confirm nothing unexpected is hiding in there. CONFIRMED USEFUL ON
+    REAL DATA: radiology.csv contains a small number of raw note_type='AR'
+    rows (addendum reports) alongside the expected 'RR' -- both correctly
+    flow through to output note_type='RR' via this source-table mapping,
+    exactly the scenario this design was meant to handle safely.
 
-A2. Timestamp field: `charttime` is used as the canonical `timestamp`
-    (--timestamp_field, default 'charttime'), falling back to `storetime`
-    only when charttime is null for a given row (MIMIC-IV-Note is
-    documented to generally populate both fields for both tables, so a null
-    is treated as a data gap, not evidence the row is unusable). This
-    matches the field every other MIMIC table uses for "when this was
-    clinically relevant", and is what every third-party MIMIC-IV-Note
-    pipeline found during a web search of standard usage. HOWEVER: I could
-    not verify against your actual data (no MIMIC-IV-Note access from
-    where this was written) whether discharge summaries' charttime carries
-    real time-of-day precision or is sometimes date-only / administratively
-    set close to a round hour. compute_leakage_diagnostics() below checks
-    exactly this on your real data (charttime-vs-storetime gap, % of DN
-    charttimes exactly at midnight, and fires a WARNING flag in
-    notes_stats.json if discharge notes look implausibly early relative to
-    onset) and notes_spot_check.json prints both raw fields side by side
-    for the sampled admissions so you can eyeball them directly. If the
-    flag fires, try `--timestamp_field storetime` and compare.
+A2. [UPDATED -- see NOTE_TYPE_TIMESTAMP_FIELD below] Timestamp field choice
+    is now PER-NOTE-TYPE, not a single global field, based on direct
+    verification against the real data:
+      - DN (discharge notes): charttime is EXACTLY midnight for 100% of
+        rows in the full 331,793-row discharge table (confirmed via direct
+        query) -- this is a fabricated date-only timestamp, not real
+        time-of-day precision. storetime's midnight rate on the same table
+        is 0.02% (68/331,793) -- genuinely precise. DN uses storetime.
+      - RR (radiology reports): charttime's midnight rate is 0% and a
+        direct --timestamp_field storetime comparison run showed no
+        meaningful improvement (hours_before_onset distribution barely
+        moved). RR stays on charttime.
+    This matters because it changes what hours_before_onset actually means
+    for DN notes -- previously (charttime-based) it was accurate only to
+    within +/-24h given the fabricated midnight time; now (storetime-based)
+    it reflects real time-of-day precision. Re-run and compare against any
+    notes.parquet produced before this fix before trusting DN-based
+    lead-time filtering downstream.
+    compute_leakage_diagnostics() still checks charttime's midnight rate
+    specifically (not whichever field is actually canonical) as an early-
+    warning signal for this exact failure mode recurring on some future
+    MIMIC-IV-Note release -- see the flag_DN_timestamp_precision note in
+    that function for the current limitation of that check.
 
 A3. DISCHARGE-NOTE LEAKAGE HANDLING -- read this one first.
     MedPatch's own paper (Al Jorf & Shamout, MLHC 2025 -- 
@@ -198,6 +208,33 @@ A9. --sample_size samples eligible hadm_ids (not raw note rows),
     silently sampling different rows across runs) -- see that file's
     comment for the full explanation. Don't remove the .sort_values() below
     without re-reading that.
+
+A10. [CSV parsing -- fixed after direct verification, mirrors a real bug
+    found in this exact way on label_sepsis3.py earlier in this project]
+    Both discharge.csv and radiology.csv are read with `parallel=false,
+    ignore_errors=false`, NOT DuckDB's default read_csv_auto(...,
+    IGNORE_ERRORS=TRUE). DuckDB's parallel CSV reader can misjudge row
+    boundaries on files with very large embedded-newline quoted fields
+    (discharge summaries and radiology reports routinely have these), and
+    IGNORE_ERRORS=TRUE then silently discards the vast majority of
+    resulting "rows" rather than erroring. Confirmed directly: the default
+    read_csv_auto parsed only 739/331,794 real discharge rows (0.22%) and
+    16,608/2,321,355 real radiology rows (~0.7%) on this exact data;
+    parallel=false recovered all 331,793 and 2,321,355 respectively (exact
+    match to PhysioNet's published counts). ignore_errors=false is
+    deliberate too -- if a genuinely malformed row exists, a loud failure
+    is far better than another silent mass-drop like this one.
+
+A11. [Fixed -- was a real, would-crash-on-first-run bug] resolve_timestamp()
+    takes a per-note-type dict (NOTE_TYPE_TIMESTAMP_FIELD) now, not a
+    single field string, per A2 above. main() previously still called it
+    with args.timestamp_field (a plain string from argparse), which throws
+    AttributeError('str' object has no attribute 'items') the moment Stage
+    2 runs -- confirmed via direct reproduction before this fix, not just
+    inferred from reading the diff. --timestamp_field is now a full
+    OVERRIDE (forces BOTH note types onto the given field, ignoring the
+    per-type default) rather than the sole field selector; leave it unset
+    to use the verified per-type default from A2.
 ================================================================================
 """
 import argparse
@@ -221,7 +258,10 @@ SOURCE_TABLE_TO_NOTE_TYPE = {"discharge": "DN", "radiology": "RR"}
 # datetime-like columns shared by both note tables (see connect_duckdb())
 NOTE_DATETIME_COLS = ["charttime", "storetime"]
 
-DEFAULT_TIMESTAMP_FIELD = "charttime"  # ASSUMPTION A2
+# Per-note-type canonical timestamp field -- see ASSUMPTION A2. Confirmed
+# directly against the full discharge table (100% vs 0.02% midnight rate)
+# and a real --timestamp_field storetime comparison run for RR.
+NOTE_TYPE_TIMESTAMP_FIELD = {"DN": "storetime", "RR": "charttime"}
 
 CHUNK_MAX_TOKENS = 512  # MedPatch convention, see chunk_note_text() / ASSUMPTION A3
 DEFAULT_TOKENIZER_NAME = "dmis-lab/biobert-base-cased-v1.1"  # ASSUMPTION A5
@@ -250,6 +290,10 @@ def _ensure_parquet_cache(view_name: str, csv_path: Path, cache_dir: Path) -> Pa
     there instead of a third one being written). radiology.csv in particular
     is large (millions of free-text rows); repeated CSV re-parses across
     dev/test runs are exactly what this avoids.
+
+    See ASSUMPTION A10 for why this uses parallel=false, ignore_errors=false
+    instead of DuckDB's default read_csv_auto(..., IGNORE_ERRORS=TRUE) --
+    that default silently parsed only ~0.2-0.7% of these specific files.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = cache_dir / f"{view_name}.parquet"
@@ -263,8 +307,7 @@ def _ensure_parquet_cache(view_name: str, csv_path: Path, cache_dir: Path) -> Pa
     tmp_con.execute("PRAGMA threads=4;")
     tmp_con.execute(f"""
         COPY (
-            SELECT * FROM read_csv_auto('{csv_path.as_posix()}',
-                ALL_VARCHAR=FALSE, IGNORE_ERRORS=TRUE)
+            SELECT * FROM read_csv('{csv_path.as_posix()}', parallel=false, ignore_errors=false)
         ) TO '{parquet_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD);
     """)
     tmp_con.close()
@@ -277,7 +320,9 @@ def _register_note_view(con: duckdb.DuckDBPyConnection, view_name: str,
                          csv_path: Path, cache_dir: Optional[Path]) -> None:
     """Registers `view_name` (discharge.csv or radiology.csv) with charttime
     and storetime explicitly cast to TIMESTAMP -- avoids DuckDB's type
-    sniffer silently falling back to VARCHAR on a sparse/all-null column."""
+    sniffer silently falling back to VARCHAR on a sparse/all-null column.
+    See ASSUMPTION A10 for the parallel=false, ignore_errors=false choice
+    (applies to both the cached and --no_cache code paths below)."""
     if not csv_path.exists():
         gz_path = csv_path.with_suffix(csv_path.suffix + ".gz")
         if gz_path.exists():
@@ -302,8 +347,8 @@ def _register_note_view(con: duckdb.DuckDBPyConnection, view_name: str,
     else:
         con.execute(
             f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT * REPLACE ({casts}) FROM read_csv_auto('{csv_path.as_posix()}', "
-            f"ALL_VARCHAR=FALSE, IGNORE_ERRORS=TRUE);"
+            f"SELECT * REPLACE ({casts}) FROM read_csv('{csv_path.as_posix()}', "
+            f"parallel=false, ignore_errors=false);"
         )
 
 
@@ -424,25 +469,42 @@ def assign_note_type(raw_df: pd.DataFrame) -> pd.Series:
     return mapped
 
 
-def resolve_timestamp(raw_df: pd.DataFrame, timestamp_field: str = DEFAULT_TIMESTAMP_FIELD):
+def resolve_timestamp(raw_df: pd.DataFrame, note_type_field: dict = NOTE_TYPE_TIMESTAMP_FIELD):
     """
-    Returns (canonical_timestamp_series, fallback_stats_dict). See
-    ASSUMPTION A2 for why charttime is primary and when storetime is used
-    as a fallback instead of dropping the row.
+    Returns (canonical_timestamp_series, fallback_stats_dict). Per-note-type
+    field choice, not a single global field -- see ASSUMPTION A2. Confirmed
+    directly against the full discharge table: charttime is exactly midnight
+    for 100% of DN rows (a fabricated date-only timestamp) vs 0.02% for
+    storetime, so DN uses storetime; RR's charttime looks fine as-is (0%
+    midnight) and switching it showed no meaningful improvement, so RR stays
+    on charttime.
+
+    `raw_df` must already have a `source_table` column (assign_note_type()
+    is NOT called here -- note type is derived from source_table directly,
+    same mapping, so this can run either before or after assign_note_type()
+    without needing raw_df["note_type"] to exist yet).
+
+    `note_type_field` lets a caller override the per-type default (e.g.
+    main()'s --timestamp_field forces BOTH types onto one field for
+    debugging -- see ASSUMPTION A11).
     """
-    if timestamp_field not in ("charttime", "storetime"):
-        raise ValueError(f"timestamp_field must be 'charttime' or 'storetime', got {timestamp_field!r}")
-    other_field = "storetime" if timestamp_field == "charttime" else "charttime"
-    primary = raw_df[timestamp_field]
-    fallback = raw_df[other_field]
-    used_fallback = primary.isna() & fallback.notna()
-    resolved = primary.where(~used_fallback, fallback)
-    stats = {
-        "primary_field": timestamp_field,
-        "n_used_fallback": int(used_fallback.sum()),
-        "n_still_null_after_fallback": int(resolved.isna().sum()),
-    }
-    return resolved, stats
+    resolved = pd.Series(pd.NaT, index=raw_df.index, dtype="datetime64[ns]")
+    fallback_stats = {}
+    for note_type, primary_field in note_type_field.items():
+        mask = raw_df["source_table"].map(SOURCE_TABLE_TO_NOTE_TYPE) == note_type
+        sub = raw_df.loc[mask]
+        other_field = "storetime" if primary_field == "charttime" else "charttime"
+        primary = sub[primary_field]
+        fallback = sub[other_field]
+        used_fallback = primary.isna() & fallback.notna()
+        row_resolved = primary.where(~used_fallback, fallback)
+        resolved.loc[mask] = row_resolved
+        fallback_stats[note_type] = {
+            "primary_field": primary_field,
+            "n_used_fallback": int(used_fallback.sum()),
+            "n_still_null_after_fallback": int(row_resolved.isna().sum()),
+        }
+    return resolved, fallback_stats
 
 
 def compute_hours_before_onset(notes_df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.DataFrame:
@@ -533,6 +595,15 @@ def compute_leakage_diagnostics(notes_df: pd.DataFrame) -> dict:
     makes downstream temporal filtering (hours_before_onset >= lead_time_h,
     applied in each model's own adapter -- see ASSUMPTION A3) actually safe
     for discharge notes. This does not drop or gate anything itself.
+
+    NOTE: pct_charttime_exactly_midnight always checks the raw `charttime`
+    field specifically, regardless of which field is actually canonical for
+    a given note type per NOTE_TYPE_TIMESTAMP_FIELD / ASSUMPTION A2. This is
+    intentional -- it's an early-warning check for this exact class of
+    problem recurring (e.g. on a future MIMIC-IV-Note release), not a
+    real-time validity check of whatever `timestamp` ended up being used.
+    Don't read "flag didn't fire" as "the canonical field is fine" -- check
+    which field is canonical separately if that matters for your use case.
     """
     diag = {}
     for note_type in ("DN", "RR"):
@@ -562,6 +633,22 @@ def compute_leakage_diagnostics(notes_df: pd.DataFrame) -> dict:
             }
         diag[note_type] = entry
 
+    for note_type, threshold in (("DN", 50.0),):
+        sub = notes_df[notes_df["note_type"] == note_type]
+        if len(sub):
+            midnight_pct = diag[note_type].get("pct_charttime_exactly_midnight")
+            if midnight_pct is not None and midnight_pct > threshold:
+                diag[f"flag_{note_type}_timestamp_precision"] = (
+                    f"WARNING: {midnight_pct}% of {note_type} raw charttimes are exactly "
+                    f"midnight -- this looks like a date-only field with a fabricated "
+                    f"00:00:00 time component, not real time-of-day precision (see "
+                    f"ASSUMPTION A2). If NOTE_TYPE_TIMESTAMP_FIELD still has {note_type} "
+                    f"on charttime, hours_before_onset for these notes carries up to "
+                    f"~24h of hidden uncertainty even though the 'suspiciously early' "
+                    f"check below didn't fire -- confirm which field is actually "
+                    f"canonical for {note_type} before trusting hour-level filtering."
+                )
+
     dn_pos = notes_df[(notes_df["note_type"] == "DN") & notes_df["hours_before_onset"].notna()]
     if len(dn_pos):
         pct_suspicious = 100.0 * (dn_pos["hours_before_onset"] > DN_SUSPICIOUS_EARLY_HOURS).mean()
@@ -571,17 +658,17 @@ def compute_leakage_diagnostics(notes_df: pd.DataFrame) -> dict:
                 f"positive admissions are timestamped more than {DN_SUSPICIOUS_EARLY_HOURS:.0f}h "
                 f"before onset. Discharge summaries should generally cluster near end-of-stay "
                 f"(well after onset, for admissions that survive to discharge); a high rate this "
-                f"early suggests charttime may not reliably reflect true note availability for "
-                f"this cohort (ASSUMPTION A2). Try --timestamp_field storetime and compare, and "
-                f"manually check a few of these specific admissions (notes_spot_check.json) "
-                f"before trusting downstream hours_before_onset-based filtering for DN."
+                f"early suggests the canonical timestamp may not reliably reflect true note "
+                f"availability for this cohort (ASSUMPTION A2). Manually check a few of these "
+                f"specific admissions (notes_spot_check.json) before trusting downstream "
+                f"hours_before_onset-based filtering for DN."
             )
     return diag
 
 
 def compute_notes_stats(notes_df: pd.DataFrame, cohort_df: pd.DataFrame,
                          raw_table_counts: dict, timestamp_fallback_stats: dict,
-                         timestamp_field: str, compute_exact_chunking_stats: bool = False,
+                         timestamp_field_used, compute_exact_chunking_stats: bool = False,
                          tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
                          chunk_max_tokens: int = CHUNK_MAX_TOKENS,
                          chunking_stats_sample_size: int = 2000,
@@ -590,9 +677,17 @@ def compute_notes_stats(notes_df: pd.DataFrame, cohort_df: pd.DataFrame,
     note admissions) plus leakage diagnostics and assumption-verification
     aids. `raw_table_counts` reflects the FULL raw tables regardless of
     --sample_size; everything else here reflects the (possibly sampled)
-    cohort actually processed this run."""
+    cohort actually processed this run.
+
+    `timestamp_field_used` is whatever main() actually used to resolve
+    timestamps this run -- either the NOTE_TYPE_TIMESTAMP_FIELD dict (the
+    normal, per-type-verified default) or a string describing a
+    --timestamp_field override forcing both types onto one field. Recorded
+    as-is (via json.dump's default=str) so notes_stats.json always shows
+    exactly what was used, not just a nominal CLI value that might not
+    match what actually happened -- see ASSUMPTION A11."""
     stats: dict = {}
-    stats["timestamp_field_used"] = timestamp_field
+    stats["timestamp_field_used"] = timestamp_field_used
     stats["timestamp_fallback"] = timestamp_fallback_stats
     stats["raw_table_counts_full_source (not sample-limited)"] = raw_table_counts
 
@@ -783,9 +878,13 @@ def main():
                               "instead of the full cohort (for quick local testing). See "
                               "ASSUMPTION A9.")
     parser.add_argument("--timestamp_field", choices=["charttime", "storetime"],
-                         default=DEFAULT_TIMESTAMP_FIELD,
-                         help="See ASSUMPTION A2. Falls back to the other field per-row if "
-                              "the primary is null.")
+                         default=None,
+                         help="OVERRIDE: force BOTH note types onto this single field, "
+                              "ignoring the per-note-type default. Leave unset (default) "
+                              "to use NOTE_TYPE_TIMESTAMP_FIELD (DN->storetime, "
+                              "RR->charttime), which was verified directly against the "
+                              "real data -- see ASSUMPTION A2. Mainly useful for "
+                              "debugging or reverting to old single-field behavior.")
     parser.add_argument("--chunk_max_tokens", type=int, default=CHUNK_MAX_TOKENS)
     parser.add_argument("--tokenizer_name", type=str, default=DEFAULT_TOKENIZER_NAME,
                          help="See ASSUMPTION A5. Only used if --compute_chunking_stats is set "
@@ -833,7 +932,17 @@ def main():
           f"({len(raw_df)} raw note rows)", file=sys.stderr)
 
     raw_df["note_type"] = assign_note_type(raw_df)
-    raw_df["timestamp"], timestamp_fallback_stats = resolve_timestamp(raw_df, args.timestamp_field)
+
+    # BUG FIX (ASSUMPTION A11): resolve_timestamp() now takes a per-note-type
+    # dict, not a single field string. --timestamp_field is a full override
+    # (forces both types onto one field) rather than the sole selector.
+    if args.timestamp_field is not None:
+        note_type_field = {"DN": args.timestamp_field, "RR": args.timestamp_field}
+        timestamp_field_used = f"OVERRIDE: both DN and RR forced to '{args.timestamp_field}'"
+    else:
+        note_type_field = NOTE_TYPE_TIMESTAMP_FIELD
+        timestamp_field_used = dict(NOTE_TYPE_TIMESTAMP_FIELD)
+    raw_df["timestamp"], timestamp_fallback_stats = resolve_timestamp(raw_df, note_type_field)
 
     print("[notes_extraction] [2/3] Joining against sepsis_onset_time, computing "
           "hours_before_onset...", file=sys.stderr)
@@ -844,7 +953,7 @@ def main():
 
     print("[notes_extraction] [3/3] Computing stats + leakage diagnostics...", file=sys.stderr)
     stats = compute_notes_stats(
-        notes_df, cohort_df, raw_table_counts, timestamp_fallback_stats, args.timestamp_field,
+        notes_df, cohort_df, raw_table_counts, timestamp_fallback_stats, timestamp_field_used,
         compute_exact_chunking_stats=args.compute_chunking_stats,
         tokenizer_name=args.tokenizer_name, chunk_max_tokens=args.chunk_max_tokens,
         chunking_stats_sample_size=args.chunking_stats_sample_size,
@@ -876,8 +985,9 @@ def main():
         json.dump(stats, f, indent=2, default=str)
     print(json.dumps(stats, indent=2, default=str))
     print(f"[notes_extraction] Wrote {stats_path}", file=sys.stderr)
-    if "flag" in stats.get("leakage_diagnostics", {}):
-        print(f"[notes_extraction] {stats['leakage_diagnostics']['flag']}", file=sys.stderr)
+    for flag_key, flag_msg in stats.get("leakage_diagnostics", {}).items():
+        if flag_key.startswith("flag"):
+            print(f"[notes_extraction] {flag_msg}", file=sys.stderr)
 
     print(f"[notes_extraction] Running spot-check on {args.n_spot_check} admission(s)...",
           file=sys.stderr)
