@@ -268,7 +268,8 @@ DEFAULT_TOKENIZER_NAME = "dmis-lab/biobert-base-cased-v1.1"  # ASSUMPTION A5
 
 DN_SUSPICIOUS_EARLY_HOURS = 24.0  # ASSUMPTION A4 -- heuristic, tune after real data review
 
-OUTPUT_COLUMNS = ["hadm_id", "note_id", "note_type", "timestamp", "raw_text", "hours_before_onset"]
+OUTPUT_COLUMNS = ["hadm_id", "note_id", "note_type", "timestamp", "raw_text",
+                  "hours_before_onset", "hours_since_admission"]
 
 
 # ==============================================================================
@@ -439,12 +440,13 @@ def load_sepsis_cohort(sepsis_labels_path: Path) -> pd.DataFrame:
             f"first; see PROJECT_CONTEXT.md sec 6 repo map."
         )
     df = pd.read_parquet(sepsis_labels_path)
-    required_cols = {"hadm_id", "sepsis_onset_time", "excluded_reason"}
+    required_cols = {"hadm_id", "sepsis_onset_time", "excluded_reason", "icu_intime"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(
             f"{sepsis_labels_path} is missing expected column(s) {sorted(missing)} -- "
-            f"does this still match label_sepsis3.py's locked output schema?"
+            f"if only icu_intime is missing, apply label_sepsis3.py's schema addition "
+            f"(icu_intime/icu_los_hours/sepsis_onset_time_hours) first."
         )
     eligible = df[df["excluded_reason"].isna()].copy()
     dup = eligible["hadm_id"].duplicated()
@@ -455,7 +457,7 @@ def load_sepsis_cohort(sepsis_labels_path: Path) -> pd.DataFrame:
               f"Keeping first occurrence of each.", file=sys.stderr)
         eligible = eligible[~dup]
     eligible["hadm_id"] = eligible["hadm_id"].astype("int64")
-    return eligible[["hadm_id", "sepsis_onset_time"]].reset_index(drop=True)
+    return eligible[["hadm_id", "sepsis_onset_time", "icu_intime"]].reset_index(drop=True)
 
 
 def assign_note_type(raw_df: pd.DataFrame) -> pd.Series:
@@ -519,10 +521,13 @@ def compute_hours_before_onset(notes_df: pd.DataFrame, cohort_df: pd.DataFrame) 
     cheap safety net.
     """
     merged = notes_df.merge(
-        cohort_df[["hadm_id", "sepsis_onset_time"]], on="hadm_id", how="inner",
+        cohort_df[["hadm_id", "sepsis_onset_time", "icu_intime"]], on="hadm_id", how="inner",
     )
     merged["hours_before_onset"] = (
         merged["sepsis_onset_time"] - merged["timestamp"]
+    ).dt.total_seconds() / 3600.0
+    merged["hours_since_admission"] = (
+        merged["timestamp"] - merged["icu_intime"]
     ).dt.total_seconds() / 3600.0
     return merged
 
@@ -540,6 +545,7 @@ def build_notes_output(df: pd.DataFrame) -> pd.DataFrame:
     out["note_type"] = out["note_type"].astype(str)
     out["raw_text"] = out["raw_text"].astype(str)
     out["hours_before_onset"] = out["hours_before_onset"].astype(float)
+    out["hours_since_admission"] = out["hours_since_admission"].astype(float)
     return out.reset_index(drop=True)
 
 

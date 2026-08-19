@@ -1,0 +1,25 @@
+run_tag: utde_ts_notes
+seed: 1002
+data_dir: /home/fluuvys-main/Research/Multi modal sepsis prediction/Multi-Modal-Sepsis-Prediction/data/cohort
+modalities: [ts, notes]
+obs_buffer_hours: 5.0
+neg_subsample_ratio: 5.0
+batch_size: 8
+lr: 0.001
+epochs: 20
+patience: 4
+eval_bootstrap_n: 1000
+model: utde
+model_args:
+  embed_dim: 64
+  embed_time: 16
+  tt_max: 48
+  layers: 2
+  lookback_hours: 48.0
+  text_lookback_hours: 48.0
+  text_model_name: emilyalsentzer/Bio_ClinicalBERT
+  max_note_tokens: 256
+  freeze_text_encoder: true
+  max_ts_events: 5085  # hard cap after lookback windowing
+  max_notes: 50         # same idea for notes
+results_dir: ../results

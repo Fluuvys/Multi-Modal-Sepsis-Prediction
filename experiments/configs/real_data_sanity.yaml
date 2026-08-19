@@ -1,0 +1,17 @@
+# First real-data run -- see run notes below for why this starts with
+# sanity_baseline rather than a real model.
+
+run_tag: real_data_sanity
+seed: 1002
+data_dir: /home/fluuvys-main/Research/Multi modal sepsis prediction/Multi-Modal-Sepsis-Prediction/data/cohort
+modalities: [ts, notes, cxr]   # all three are real now -- see run notes for what
+                                # each registered model actually consumes
+obs_buffer_hours: 5.0
+neg_subsample_ratio: 5.0
+batch_size: 32
+lr: 0.001
+epochs: 2
+patience: 1
+eval_bootstrap_n: 100
+model: sanity_baseline
+results_dir: ../results

@@ -1,0 +1,3 @@
+gsutil -u project-3a8c4ca8-da13-47aa-945 -m rsync -r 'gs://mimic-cxr-jpg-2.1.0.physionet.org/files/p10/p10001217' '/home/fluuvys-main/sepsis_proj/Data/physionet.org/files/mimic-cxr-jpg/2.0.0/files/p10/p10001217'
+gsutil -u project-3a8c4ca8-da13-47aa-945 -m rsync -r 'gs://mimic-cxr-jpg-2.1.0.physionet.org/files/p10/p10001884' '/home/fluuvys-main/sepsis_proj/Data/physionet.org/files/mimic-cxr-jpg/2.0.0/files/p10/p10001884'
+gsutil -u project-3a8c4ca8-da13-47aa-945 -m rsync -r 'gs://mimic-cxr-jpg-2.1.0.physionet.org/files/p10/p10002013' '/home/fluuvys-main/sepsis_proj/Data/physionet.org/files/mimic-cxr-jpg/2.0.0/files/p10/p10002013'

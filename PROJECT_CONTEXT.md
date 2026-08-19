@@ -278,7 +278,7 @@ sepsis-repo/
       first-charted-measurement, not necessarily true physiological onset —
       see Section 7. Follow-up task (not blocking): quantify this at full
       cohort scale for the paper's limitations section.
-- [ ] EHR/notes/CXR preprocessing pipelines
+- [x] EHR/notes/CXR preprocessing pipelines
 - [ ] Step 0 signal-verification diagnostic (Section 3) — MUST pass before Module 1/2 build
 - [ ] Baseline reproductions (MedFuse / FuseMoE / MedPatch / DrFuse)
 - [ ] Our backbone architecture
