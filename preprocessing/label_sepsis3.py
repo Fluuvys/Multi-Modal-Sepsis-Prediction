@@ -362,8 +362,8 @@ def _ensure_parquet_cache(view_name: str, csv_path: Path, cache_dir: Path) -> Pa
     tmp_con.execute("PRAGMA threads=4;")
     tmp_con.execute(f"""
         COPY (
-            SELECT * FROM read_csv_auto('{csv_path.as_posix()}',
-                ALL_VARCHAR=FALSE, IGNORE_ERRORS=TRUE)
+            SELECT * FROM read_csv('{csv_path.as_posix()}',
+                parallel=false, ignore_errors=false)
         ) TO '{parquet_path.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD);
     """)
     tmp_con.close()
@@ -451,8 +451,8 @@ def connect_duckdb(hosp_dir: Path, icu_dir: Path, sample_size: Optional[int],
             replace_clause = f" REPLACE ({casts})"
         con.execute(
             f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT *{replace_clause} FROM read_csv_auto('{path.as_posix()}', "
-            f"ALL_VARCHAR=FALSE, IGNORE_ERRORS=TRUE);"
+            f"SELECT *{replace_clause} FROM read_csv('{path.as_posix()}', "
+            f"parallel=false, ignore_errors=false);"
         )
 
     # hosp
@@ -1537,9 +1537,15 @@ def assign_labels(con: duckdb.DuckDBPyConnection, cohort: pd.DataFrame,
         final_excluded["sepsis_onset_time"] = pd.NaT
         final_excluded["sofa_at_onset"] = np.nan
         final_excluded["label"] = 0
+        # SCHEMA ADDITION: see the matching edit at the bottom of this function
+        # for the full rationale (experiments/dataset.py's "SCHEMA GAP").
+        final_excluded["icu_intime"] = final_excluded["intime"]
+        final_excluded["icu_los_hours"] = final_excluded["los_hours"]
+        final_excluded["sepsis_onset_time_hours"] = np.nan  # everyone here is label=0
         return final_excluded[[
-            "subject_id", "hadm_id", "sepsis_onset_time", "sofa_at_onset",
-            "label", "excluded_reason", "split",
+            "subject_id", "hadm_id", "sepsis_onset_time", "sepsis_onset_time_hours",
+            "sofa_at_onset", "label", "excluded_reason", "split",
+            "icu_intime", "icu_los_hours",
         ]]
 
     hadm_ids = eligible["hadm_id"].astype(int).tolist()
@@ -1627,9 +1633,24 @@ def assign_labels(con: duckdb.DuckDBPyConnection, cohort: pd.DataFrame,
 
     final = pd.concat([eligible, excluded_already], ignore_index=True, sort=False)
 
+    # SCHEMA ADDITION (post-hoc, added for the rolling hourly training task):
+    # experiments/dataset.py needs an admission-time reference independent of
+    # sepsis_onset_time, since sepsis_onset_time is null for every negative
+    # admission -- there'd be no way to build hourly timepoints for negatives
+    # otherwise. intime/los_hours already exist here (Stage A, build_cohort())
+    # -- this just carries them through to the locked output instead of
+    # dropping them at this final projection. sepsis_onset_time_hours mirrors
+    # sepsis_onset_time's own null-for-negatives convention: only populated
+    # when label == 1, matching what dataset.py's SepsisDataset requires.
+    final["icu_intime"] = final["intime"]
+    final["icu_los_hours"] = final["los_hours"]
+    onset_hours = (final["sepsis_onset_time"] - final["intime"]).dt.total_seconds() / 3600.0
+    final["sepsis_onset_time_hours"] = onset_hours.where(final["label"] == 1)
+
     return final[[
-        "subject_id", "hadm_id", "sepsis_onset_time", "sofa_at_onset",
-        "label", "excluded_reason", "split",
+        "subject_id", "hadm_id", "sepsis_onset_time", "sepsis_onset_time_hours",
+        "sofa_at_onset", "label", "excluded_reason", "split",
+        "icu_intime", "icu_los_hours",
     ]].reset_index(drop=True)
 
 

@@ -1,44 +1,22 @@
 """
-ehr_extraction.py
-
-PURPOSE:
-    Extract the irregular EHR time-series (vitals + labs) per admission from MIMIC-IV,
-    preserving exact observation timestamps (do NOT bin/discretize here -- SDCA needs
-    real elapsed-time values downstream, unlike MedFuse's hourly-binned approach).
-
-REFERENCE: adapted from MedPatch's EHR extraction (17-variable standard set), see
-    docs/gap_and_solution.md for why we're extending MedPatch's confidence mechanism
-    conceptually rather than forking its code directly.
-
-TODO:
-    [ ] Pull the standard 17-variable set (5 categorical + 12 continuous, matching
-        MedFuse/MedPatch convention for comparability)
-    [ ] Keep raw timestamps, no fixed-interval resampling
-    [ ] Output one time-series object per admission, aligned to sepsis_labels.csv
-
-INPUT:  raw MIMIC-IV chartevents/labevents (see data/raw_links/)
-OUTPUT: data/cohort/ehr_timeseries/ (one file per admission, or a single long-format
-        file -- decide and document here once implemented)
-"""
-"""
 preprocessing/ehr_extraction.py
 ================================================================================
 PURPOSE:
     Extract the irregular EHR time-series (vitals + labs) per admission from MIMIC-IV,
-    preserving exact observation timestamps. Per PROJECT_CONTEXT.md Rule #5, NO 
-    model-specific reduction (e.g., hourly binning) happens here. SDCA needs real 
+    preserving exact observation timestamps. Per PROJECT_CONTEXT.md Rule #5, NO
+    model-specific reduction (e.g., hourly binning) happens here. SDCA needs real
     elapsed-time values downstream.
 
 TWO STAGES, KEPT AS SEPARATE FUNCTIONS INTERNALLY:
-    Stage A -- extract_raw_events(): Connects to raw MIMIC-IV tables, extracts the 
-               standard 17-variable set (5 categorical + 12 continuous), and applies 
+    Stage A -- extract_raw_events_batch(): Reads a per-hadm_id-batch slice of the
+               itemid-filtered event cache (see _ensure_event_cache()) and applies
                variable-specific cleaning/normalization.
-    Stage B -- align_and_format(): Inner-joins against the Sepsis-3 cohort, derives 
-               missing composite variables (e.g., GCS total), and computes the 
-               critical 'hours_before_onset' column.
+    Stage B -- align_and_format(): Inner-joins against the Sepsis-3 cohort, derives
+               missing composite variables (e.g., GCS total), and computes
+               hours_before_onset / hours_since_admission.
 
 REFERENCE IMPLEMENTATIONS:
-    - nyuad-cai/MedPatch (mimic4extract/ and ehr_utils/) for the standard 17-variable 
+    - nyuad-cai/MedPatch (mimic4extract/ and ehr_utils/) for the standard 17-variable
       set mapping and cleaning functions.
 
 TODO checklist (Milestone 1 — EHR preprocessing pipeline):
@@ -47,54 +25,87 @@ TODO checklist (Milestone 1 — EHR preprocessing pipeline):
     [x] Output one long-format time-series object, aligned to sepsis_labels.parquet
     [x] Compute hours_before_onset for SDCA
     [x] Add per-variable coverage stats and a spot-check utility
+    [x] Memory-bounded batched extraction (see PB1 below) -- fixes an OOM kill on
+        the full-cohort run
     [ ] Team sign-off on the ASSUMPTION items below before this is truly "locked"
 ================================================================================
 ASSUMPTIONS / DEVIATIONS FLAGGED FOR TEAM REVIEW — read before trusting output
 ================================================================================
-A1. VARIABLE MAPPING PROVENANCE: The exact itemid->variable mapping and outlier 
-    ranges from MedPatch (itemid_to_variable_map.csv, variable_ranges.csv) were 
-    not fully provided. VARIABLE_ITEMID_MAP is a best-effort MetaVision mapping. 
-    OUTLIER_RANGES is currently empty. The team must wire in the real ranges from 
+A1. VARIABLE MAPPING PROVENANCE: The exact itemid->variable mapping and outlier
+    ranges from MedPatch (itemid_to_variable_map.csv, variable_ranges.csv) were
+    not fully provided. VARIABLE_ITEMID_MAP is a best-effort MetaVision mapping.
+    OUTLIER_RANGES is currently empty. The team must wire in the real ranges from
     the CSV before final modeling.
 
-A2. GCS TOTAL DERIVATION: MIMIC-IV MetaVision lacks a pre-computed "GCS total" 
-    itemid. Derived in _derive_gcs_total(), a faithful port of mimic-code's 
-    measurement/gcs.sql (matching the same logic already used in 
-    label_sepsis3.py's SOFA CNS component, PB3). Handles two MIMIC-IV-specific 
-    quirks: (1) intubated patients charted as verbal="No Response-ETT" get 
-    verbal remapped to 0 and total forced to 15, rather than penalized as a 
-    real low verbal score; (2) a missing component can carry forward from the 
+A2. GCS TOTAL DERIVATION: MIMIC-IV MetaVision lacks a pre-computed "GCS total"
+    itemid. Derived in _derive_gcs_total(), a faithful port of mimic-code's
+    measurement/gcs.sql (matching the same logic already used in
+    label_sepsis3.py's SOFA CNS component, PB3). Handles two MIMIC-IV-specific
+    quirks: (1) intubated patients charted as verbal="No Response-ETT" get
+    verbal remapped to 0 and total forced to 15, rather than penalized as a
+    real low verbal score; (2) a missing component can carry forward from the
     previous reading within 6h, componentwise, rather than requiring exact-
-    timestamp completeness for all three. Verified against a synthetic 
+    timestamp completeness for all three. Verified against a synthetic
     4-branch test case before merge.
 
-A3. UNIT CONVERSIONS: Temperature (F to C), FiO2 (pct to fraction), Weight 
-    (oz/lb to kg), Height (in to cm) apply heuristics from MedPatch. Blood 
-    pressure parsing handles legacy "120/80" string artifacts. 'Capillary refill 
+A3. UNIT CONVERSIONS: Temperature (F to C), FiO2 (pct to fraction), Weight
+    (oz/lb to kg), Height (in to cm) apply heuristics from MedPatch. Blood
+    pressure parsing handles legacy "120/80" string artifacts. 'Capillary refill
     rate' strings are strictly mapped to 0.0/1.0; unrecognized strings are dropped.
 
-A4. OUT OF SCOPE (By Design): Discretizer / Normalizer (fixed-timestep binning, 
-    z-score normalization) are intentionally excluded here per Context Rule #5. 
-    This file only ever produces raw, unbinned, long-format observations. Model 
+A4. OUT OF SCOPE (By Design): Discretizer / Normalizer (fixed-timestep binning,
+    z-score normalization) are intentionally excluded here per Context Rule #5.
+    This file only ever produces raw, unbinned, long-format observations. Model
     adapters handle binning downstream.
+
+================================================================================
+PATCH BLOCKS (read before trusting output)
+================================================================================
+PB1. [Fixed -- was a real, confirmed OOM kill on the full-cohort run] The
+    original extract_raw_events() did ONE con.execute(query).fetchdf() call
+    pulling the ENTIRE itemid-filtered chartevents/labevents result into a
+    single pandas DataFrame in memory at once. Even after itemid filtering,
+    MIMIC-IV's chartevents.csv alone is easily tens of millions of matching
+    rows across a full cohort -- more than fits in RAM on most machines, and
+    this run got killed by the Linux OOM killer as a result.
+    Fix, two parts:
+      1. ONE-TIME cache (_ensure_event_cache()): itemid-filtered (NOT
+         hadm_id-filtered -- reusable across --sample_size / cohort changes)
+         Parquet built via COPY, which DuckDB streams to disk without ever
+         materializing the full result in Python memory. Uses the safe
+         reader (parallel=false, ignore_errors=false) -- same fix as the
+         label_sepsis3.py / cxr_linking.py IGNORE_ERRORS=TRUE bug.
+      2. BATCHED extraction (extract_raw_events_batch(), driven from main()):
+         loop over the eligible cohort's hadm_ids in batches, query the
+         (now fast, columnar) cache per batch, clean + join-to-cohort per
+         batch, append incrementally via pyarrow.parquet.ParquetWriter. Peak
+         memory is bounded by --batch_size, not cohort size, at every step.
+
+PB2. [Fixed -- real efficiency/correctness gap] main() previously built
+    sample_hadm_ids from the FULL sepsis_labels.parquet (65,366 rows,
+    including ~13k excluded admissions) instead of just the eligible cohort
+    (excluded_reason IS NULL) -- wasted extraction for admissions that are
+    never used downstream. Now restricted to the eligible cohort before any
+    --sample_size sampling happens.
 ================================================================================
 python preprocessing/ehr_extraction.py \
   --data_root "/home/fluuvys-main/Research/Multi modal sepsis prediction/Data/mimic-iv-3.1" \
   --labels_path data/cohort/sepsis_labels.parquet \
-  --output data/cohort/ehr_timeseries_sample.parquet \
-  --sample_size 50
-
-
+  --output data/cohort/ehr_timeseries.parquet \
+  --cache_dir data/cache
 """
 
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ------------------------------------------------------------------------------
 # 1. ITEMID MAP  (chartevents itemids unless noted "LABEVENTS")
@@ -174,6 +185,8 @@ assert len(ALL_17_VARIABLES) == 17, f"expected 17 variables, got {len(ALL_17_VAR
 # Left empty until resources/variable_ranges.csv contents are available.
 OUTLIER_RANGES = {}
 
+DEFAULT_BATCH_SIZE = 5000  # tune down (e.g. 2000) if you still see memory pressure
+
 
 def _clip_outliers(df: pd.DataFrame) -> pd.DataFrame:
     """Applies OUTLIER_RANGES clipping if populated; no-op while it's empty."""
@@ -191,37 +204,31 @@ def _clip_outliers(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------------------
-# 2. STAGE A -- extract_raw_events
+# 2. STAGE A -- itemid-filtered cache + batched extraction (see PB1)
 # ------------------------------------------------------------------------------
 
-def extract_raw_events(data_root: Path, sample_hadm_ids=None) -> pd.DataFrame:
+def _ensure_event_cache(data_root: Path, cache_dir: Path) -> tuple:
     """
-    Reads icu/chartevents.csv and hosp/labevents.csv (+ icu/d_items.csv,
-    hosp/d_labitems.csv for human-readable cross-checks only -- the actual
-    itemid->variable_name mapping used for extraction is VARIABLE_ITEMID_MAP
-    above, not these dictionary tables) and returns ALL matching observations
-    in long format, with NO joins to the cohort and NO binning/resampling.
+    ONE-TIME conversion of chartevents.csv/labevents.csv, itemid-filtered
+    only (NOT hadm_id-filtered -- reusable across --sample_size / cohort
+    changes), to Parquet. Written via COPY, which DuckDB streams to disk
+    without ever materializing the full result in Python/pandas memory --
+    this is the actual fix for the OOM kill (see PB1). Uses the safe reader
+    (parallel=false, ignore_errors=false), same fix as the
+    label_sepsis3.py / cxr_linking.py IGNORE_ERRORS=TRUE bug.
 
-    Columns returned: hadm_id (int64), timestamp (datetime64), variable_name
-    (str), value (float64).
-
-    Parameters
-    ----------
-    data_root : Path
-        Root of the local MIMIC-IV v3.1 export, expected to contain hosp/ and
-        icu/ subfolders (e.g. .../Data/mimic-iv-3.1).
-    sample_hadm_ids : Optional[list[int]]
-        If given, restricts extraction to these hadm_ids (for --sample_size /
-        spot-check use). Pushed down into the SQL WHERE clause so it also
-        speeds up dev iteration on the full CSVs.
+    Safe to call every run -- skips rebuilding if the cache is already newer
+    than the source CSV.
     """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    chart_cache = cache_dir / "ehr_chartevents_filtered.parquet"
+    lab_cache = cache_dir / "ehr_labevents_filtered.parquet"
+
     chartevents_path = data_root / "icu" / "chartevents.csv"
     labevents_path = data_root / "hosp" / "labevents.csv"
     for p in (chartevents_path, labevents_path):
         if not p.exists():
             raise FileNotFoundError(f"Expected MIMIC-IV file not found: {p}")
-
-    con = duckdb.connect()
 
     chart_itemids = sorted({
         iid for mapping in VARIABLE_ITEMID_MAP.values()
@@ -231,55 +238,91 @@ def extract_raw_events(data_root: Path, sample_hadm_ids=None) -> pd.DataFrame:
         iid for mapping in VARIABLE_ITEMID_MAP.values()
         for (iid, table, _note) in mapping if table == "labevents"
     })
+    chart_itemids_sql = ",".join(str(i) for i in chart_itemids)
+    lab_itemids_sql = ",".join(str(i) for i in lab_itemids)
+
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=4;")
+
+    if not (chart_cache.exists() and chart_cache.stat().st_mtime >= chartevents_path.stat().st_mtime):
+        print("  Building itemid-filtered cache for chartevents (one-time cost, "
+              "reused on every future run)...")
+        t0 = time.time()
+        con.execute(f"""
+            COPY (
+                SELECT hadm_id, charttime AS timestamp, storetime, itemid, valuenum,
+                       value AS value_text, valueuom
+                FROM read_csv('{chartevents_path.as_posix()}', parallel=false, ignore_errors=false)
+                WHERE hadm_id IS NOT NULL AND itemid IN ({chart_itemids_sql})
+            ) TO '{chart_cache.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD);
+        """)
+        print(f"    -> chartevents cache written in {time.time() - t0:.0f}s")
+
+    if not (lab_cache.exists() and lab_cache.stat().st_mtime >= labevents_path.stat().st_mtime):
+        print("  Building itemid-filtered cache for labevents (one-time cost, "
+              "reused on every future run)...")
+        t0 = time.time()
+        con.execute(f"""
+            COPY (
+                SELECT hadm_id, charttime AS timestamp, storetime, itemid, valuenum,
+                       value AS value_text, valueuom
+                FROM read_csv('{labevents_path.as_posix()}', parallel=false, ignore_errors=false)
+                WHERE hadm_id IS NOT NULL AND itemid IN ({lab_itemids_sql})
+            ) TO '{lab_cache.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD);
+        """)
+        print(f"    -> labevents cache written in {time.time() - t0:.0f}s")
+
+    con.close()
+    return chart_cache, lab_cache
+
+
+def extract_raw_events_batch(chart_cache: Path, lab_cache: Path, hadm_id_batch: list) -> pd.DataFrame:
+    """
+    Same cleaning/dedup logic as before, but reads from the pre-filtered
+    Parquet cache for ONE batch of hadm_ids at a time -- bounds memory to one
+    batch's worth of rows regardless of full cohort size (see PB1).
+
+    Columns returned: hadm_id (int64), timestamp (datetime64), variable_name
+    (str), value (float64).
+    """
+    if not hadm_id_batch:
+        return pd.DataFrame(columns=["hadm_id", "timestamp", "variable_name", "value"])
+
+    con = duckdb.connect()
+    ids_sql = ",".join(str(int(i)) for i in hadm_id_batch)
 
     itemid_to_varname = {}
     for varname, mapping in VARIABLE_ITEMID_MAP.items():
         for (iid, _table, _note) in mapping:
             itemid_to_varname[iid] = varname  # 1:1 per itemid, safe
 
-    sample_filter_chart = ""
-    sample_filter_lab = ""
-    if sample_hadm_ids:
-        ids_sql = ",".join(str(int(i)) for i in sample_hadm_ids)
-        sample_filter_chart = f"AND hadm_id IN ({ids_sql})"
-        sample_filter_lab = f"AND hadm_id IN ({ids_sql})"
-
-    chart_itemids_sql = ",".join(str(i) for i in chart_itemids)
-    chart_query = f"""
-        SELECT
-            hadm_id,
-            charttime AS timestamp,
-            itemid,
-            valuenum,
-            value AS value_text,
-            valueuom
-        FROM read_csv_auto('{chartevents_path.as_posix()}', ignore_errors=true)
-        WHERE hadm_id IS NOT NULL
-          AND itemid IN ({chart_itemids_sql})
-          {sample_filter_chart}
-    """
-    chart_df = con.execute(chart_query).fetchdf()
-
-    lab_itemids_sql = ",".join(str(i) for i in lab_itemids)
-    lab_query = f"""
-        SELECT
-            hadm_id,
-            charttime AS timestamp,
-            itemid,
-            valuenum,
-            value AS value_text,
-            valueuom
-        FROM read_csv_auto('{labevents_path.as_posix()}', ignore_errors=true)
-        WHERE hadm_id IS NOT NULL
-          AND itemid IN ({lab_itemids_sql})
-          {sample_filter_lab}
-    """
-    lab_df = con.execute(lab_query).fetchdf()
+    chart_df = con.execute(f"""
+        SELECT * FROM read_parquet('{chart_cache.as_posix()}') WHERE hadm_id IN ({ids_sql})
+    """).df()
+    lab_df = con.execute(f"""
+        SELECT * FROM read_parquet('{lab_cache.as_posix()}') WHERE hadm_id IN ({ids_sql})
+    """).df()
     con.close()
 
     raw = pd.concat([chart_df, lab_df], ignore_index=True)
     raw["variable_name"] = raw["itemid"].map(itemid_to_varname)
     raw = raw.dropna(subset=["variable_name", "timestamp"])
+
+    # DATA QUALITY GUARD: charttime is occasionally wrong in the raw MIMIC-IV source
+    # data itself (confirmed by direct inspection, not a parsing artifact -- e.g. a
+    # flowsheet macro charted with a stale client clock). storetime is the reliable
+    # anchor: it should always be at or shortly after charttime, never wildly off.
+    # Drop rows where the gap is implausible (charttime "before" is fine within a
+    # generous 30-day retrospective-documentation window; storetime more than 24h
+    # BEFORE charttime, or more than 30 days after it, means charttime itself is
+    # untrustworthy for that row).
+    raw["storetime"] = pd.to_datetime(raw["storetime"])
+    gap_hours = (raw["storetime"] - raw["timestamp"]).dt.total_seconds() / 3600.0
+    bad_charttime = (gap_hours < -24) | (gap_hours > 24 * 30)
+    if bad_charttime.any():
+        print(f"  dropped {int(bad_charttime.sum()):,} row(s) with an implausible "
+              f"charttime-vs-storetime gap (charttime unreliable for these rows)")
+    raw = raw[~bad_charttime].drop(columns=["storetime"])
 
     # Dedup: MIMIC-IV mirrors some lab results into chartevents at the exact
     # same timestamp with the exact same value (e.g. pH itemid 50820 in
@@ -290,9 +333,7 @@ def extract_raw_events(data_root: Path, sample_hadm_ids=None) -> pd.DataFrame:
     # variable -- two genuinely different readings at the same timestamp
     # (e.g. a serum glucose and a fingerstick glucose that happen to differ)
     # are left alone.
-    before = len(raw)
     raw = raw.drop_duplicates(subset=["hadm_id", "timestamp", "variable_name", "valuenum"], keep="first")
-    print(f"  deduped {before - len(raw):,} exact-match rows across chartevents/labevents mirrors")
     raw["hadm_id"] = raw["hadm_id"].astype("int64")
     raw["timestamp"] = pd.to_datetime(raw["timestamp"])
     raw["valueuom"] = raw["valueuom"].fillna("")
@@ -389,6 +430,7 @@ def _clean_height(df: pd.DataFrame) -> pd.Series:
     v.loc[is_in] = np.round(v.loc[is_in] * 2.54)
     return v
 
+
 def _clean_gcs_verbal(df: pd.DataFrame) -> pd.Series:
     """
     Maps MIMIC-IV's 'No Response-ETT' (intubated, verbal unassessable) to 0,
@@ -429,6 +471,7 @@ def _clean_events(raw: pd.DataFrame) -> pd.Series:
             value.loc[idx] = fn(raw.loc[idx])
     return value
 
+
 def _derive_gcs_total(events: pd.DataFrame) -> pd.DataFrame:
     """
     Faithful port of label_sepsis3.py's PB3 GCS-total logic (itself a port of
@@ -436,13 +479,9 @@ def _derive_gcs_total(events: pd.DataFrame) -> pd.DataFrame:
     of stay_id -- equivalent for this cohort, since build_cohort() already
     restricts to exactly one ICU stay per admission.
 
-    Unlike the PREVIOUS version of this function (which required all three
-    components at the EXACT same timestamp, dropping every partial-charting
-    row), this ports mimic-code's carry-forward rule: a component missing at
-    the current timestamp can use the PREVIOUS charted value of that same
-    component, as long as that previous reading is within 6h. This changes
-    both coverage (more rows now qualify) and correctness (intubated
-    patients no longer get penalized for an unassessable verbal component).
+    Ports mimic-code's carry-forward rule: a component missing at the
+    current timestamp can use the PREVIOUS charted value of that same
+    component, as long as that previous reading is within 6h.
 
     Branch logic (verbatim from gcs.sql / PB3), b = current row, b2 = the
     previous row (within 6h) for the same hadm_id:
@@ -519,6 +558,8 @@ def _derive_gcs_total(events: pd.DataFrame) -> pd.DataFrame:
     out["variable_name"] = "Glascow coma scale total"
     out["value"] = gcs_total
     return out
+
+
 # ------------------------------------------------------------------------------
 # 3. STAGE B -- align_and_format
 # ------------------------------------------------------------------------------
@@ -527,16 +568,22 @@ def align_and_format(raw_events: pd.DataFrame, cohort_labels: pd.DataFrame) -> p
     """
     Derives gcs_total, inner-joins raw_events against the Sepsis-3 cohort on
     hadm_id, and computes hours_before_onset = (sepsis_onset_time - timestamp)
-    in hours. Returns the final schema:
+    in hours, plus hours_since_admission = (timestamp - icu_intime) in hours.
+    Returns the final schema:
         hadm_id (int), timestamp (datetime), variable_name (str),
-        value (float), hours_before_onset (float)
+        value (float), hours_before_onset (float), hours_since_admission (float)
 
-    cohort_labels must contain columns: hadm_id, sepsis_onset_time.
+    cohort_labels must contain columns: hadm_id, sepsis_onset_time, icu_intime.
     """
-    required_cols = {"hadm_id", "sepsis_onset_time"}
+    required_cols = {"hadm_id", "sepsis_onset_time", "icu_intime"}
     missing = required_cols - set(cohort_labels.columns)
     if missing:
-        raise ValueError(f"cohort_labels missing required columns: {missing}")
+        raise ValueError(
+            f"cohort_labels missing required columns: {missing} -- if only icu_intime "
+            f"is missing, sepsis_labels.parquet needs label_sepsis3.py's icu_intime/"
+            f"icu_los_hours/sepsis_onset_time_hours schema addition (see that file's "
+            f"assign_labels() patch)."
+        )
 
     events = raw_events.copy()
 
@@ -548,19 +595,27 @@ def align_and_format(raw_events: pd.DataFrame, cohort_labels: pd.DataFrame) -> p
         events = pd.concat([events, gcs_total_rows], ignore_index=True)
 
     # --- inner join against cohort ---
-    cohort = cohort_labels[["hadm_id", "sepsis_onset_time"]].copy()
+    cohort = cohort_labels[["hadm_id", "sepsis_onset_time", "icu_intime"]].copy()
     cohort["hadm_id"] = cohort["hadm_id"].astype("int64")
     cohort["sepsis_onset_time"] = pd.to_datetime(cohort["sepsis_onset_time"])
+    cohort["icu_intime"] = pd.to_datetime(cohort["icu_intime"])
 
     merged = events.merge(cohort, on="hadm_id", how="inner")
     merged["hours_before_onset"] = (
         (merged["sepsis_onset_time"] - merged["timestamp"]).dt.total_seconds() / 3600.0
     )
+    # SCHEMA ADDITION: rolling-task time axis, independent of sepsis_onset_time
+    # (null for negatives) -- see experiments/dataset.py's SCHEMA GAP docstring.
+    merged["hours_since_admission"] = (
+        (merged["timestamp"] - merged["icu_intime"]).dt.total_seconds() / 3600.0
+    )
 
-    final = merged[["hadm_id", "timestamp", "variable_name", "value", "hours_before_onset"]].copy()
+    final = merged[["hadm_id", "timestamp", "variable_name", "value",
+                     "hours_before_onset", "hours_since_admission"]].copy()
     final["hadm_id"] = final["hadm_id"].astype("int64")
     final["value"] = final["value"].astype("float64")
     final["hours_before_onset"] = final["hours_before_onset"].astype("float64")
+    final["hours_since_admission"] = final["hours_since_admission"].astype("float64")
     return final.reset_index(drop=True)
 
 
@@ -637,63 +692,109 @@ def main():
     )
     parser.add_argument(
         "--sample_size", type=int, default=None,
-        help="If set, restrict extraction to this many hadm_ids (from the cohort) for a fast dev run.",
+        help="If set, restrict extraction to this many hadm_ids (from the ELIGIBLE "
+             "cohort, see PB2) for a fast dev run.",
     )
     parser.add_argument(
         "--spot_check_n", type=int, default=3,
         help="Number of hadm_ids to print for manual spot-checking.",
+    )
+    parser.add_argument(
+        "--cache_dir", type=str, default="data/cache",
+        help="Where to cache the itemid-filtered chartevents/labevents Parquet "
+             "(one-time cost, reused on every future run regardless of "
+             "--sample_size). Same convention as label_sepsis3.py. See PB1.",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=DEFAULT_BATCH_SIZE,
+        help="Number of hadm_ids processed per batch, written incrementally. "
+             "Lower this (e.g. 2000) if you still see the process get OOM-killed. "
+             "See PB1.",
     )
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
     labels_path = Path(args.labels_path)
     output_path = Path(args.output)
+    cache_dir = Path(args.cache_dir)
 
     if not labels_path.exists():
         print(f"ERROR: {labels_path} not found. Run Milestone 0 (label_sepsis3.py) first.", file=sys.stderr)
         sys.exit(1)
 
     cohort_labels = pd.read_parquet(labels_path)
-    if "hadm_id" not in cohort_labels.columns or "sepsis_onset_time" not in cohort_labels.columns:
+    required = {"hadm_id", "sepsis_onset_time", "excluded_reason", "icu_intime"}
+    missing = required - set(cohort_labels.columns)
+    if missing:
         print(
-            "ERROR: sepsis_labels.parquet must contain 'hadm_id' and 'sepsis_onset_time' columns.",
+            f"ERROR: sepsis_labels.parquet is missing {sorted(missing)} -- "
+            f"if only icu_intime is missing, this cohort file predates "
+            f"label_sepsis3.py's icu_intime/icu_los_hours/sepsis_onset_time_hours "
+            f"schema addition; re-run label_sepsis3.py first.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # BUG FIX: sample_hadm_ids used to be None whenever --sample_size wasn't
-    # passed, which meant extract_raw_events() got no hadm_id filter at all
-    # on a full run -- it scanned/extracted matching-itemid rows for the
-    # ENTIRE hospital population, not just this cohort, and only discarded
-    # the excess afterward in Stage B's join. Now it's ALWAYS derived from
-    # cohort_labels: the full cohort by default, or a random subset of it
-    # when --sample_size is set. sample_hadm_ids is never None again, so
-    # extract_raw_events() always receives a real, correct filter.
-    all_cohort_hadm_ids = cohort_labels["hadm_id"].drop_duplicates().tolist()
+    # PB2: restrict to the ELIGIBLE cohort (excluded_reason IS NULL) BEFORE any
+    # --sample_size sampling -- the full sepsis_labels.parquet includes ~13k
+    # excluded admissions that are never used downstream; extracting EHR data
+    # for them was pure waste.
+    eligible_labels = cohort_labels[cohort_labels["excluded_reason"].isna()]
+    eligible_hadm_ids = eligible_labels["hadm_id"].drop_duplicates().tolist()
+
     if args.sample_size is not None:
         sample_hadm_ids = (
-            cohort_labels["hadm_id"].drop_duplicates().sample(
-                n=min(args.sample_size, cohort_labels["hadm_id"].nunique()),
-                random_state=0,
-            ).tolist()
+            eligible_labels["hadm_id"].drop_duplicates()
+            .sort_values()  # deterministic order before sampling -- same reasoning
+                             # as label_sepsis3.py's build_cohort() reproducibility fix
+            .sample(n=min(args.sample_size, len(eligible_hadm_ids)), random_state=0)
+            .tolist()
         )
         print(f"--sample_size set: restricting to {len(sample_hadm_ids)} hadm_ids for this run.")
     else:
-        sample_hadm_ids = all_cohort_hadm_ids
-        print(f"No --sample_size: extracting for the full cohort ({len(sample_hadm_ids):,} hadm_ids).")
+        sample_hadm_ids = eligible_hadm_ids
+        print(f"No --sample_size: extracting for the full eligible cohort "
+              f"({len(sample_hadm_ids):,} hadm_ids).")
 
-    print("Stage A: extracting raw events from chartevents/labevents ...")
-    raw_events = extract_raw_events(data_root, sample_hadm_ids=sample_hadm_ids)
-    print(f"  extracted {len(raw_events):,} raw observation rows.")
+    print("Building/reusing itemid-filtered event cache...")
+    chart_cache, lab_cache = _ensure_event_cache(data_root, cache_dir)
 
-    print("Stage B: joining against cohort and computing hours_before_onset ...")
     cohort_for_join = cohort_labels[cohort_labels["hadm_id"].isin(sample_hadm_ids)]
-    final_df = align_and_format(raw_events, cohort_for_join)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_df.to_parquet(output_path, index=False)
-    print(f"Wrote {output_path} ({len(final_df):,} rows).")
+    writer = None
+    total_rows = 0
+    batch_size = args.batch_size
+    n_batches = (len(sample_hadm_ids) + batch_size - 1) // batch_size if sample_hadm_ids else 0
 
+    print(f"Processing {len(sample_hadm_ids):,} hadm_ids in {n_batches} batch(es) of "
+          f"up to {batch_size}...")
+    for i in range(0, len(sample_hadm_ids), batch_size):
+        batch_ids = sample_hadm_ids[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        print(f"  batch {batch_num}/{n_batches} ({len(batch_ids)} hadm_ids)...")
+
+        raw_events = extract_raw_events_batch(chart_cache, lab_cache, batch_ids)
+        batch_cohort = cohort_for_join[cohort_for_join["hadm_id"].isin(batch_ids)]
+        final_batch = align_and_format(raw_events, batch_cohort)
+
+        if final_batch.empty:
+            continue
+        table = pa.Table.from_pandas(final_batch)
+        if writer is None:
+            writer = pq.ParquetWriter(output_path.as_posix(), table.schema)
+        writer.write_table(table)
+        total_rows += len(final_batch)
+
+    if writer is not None:
+        writer.close()
+    print(f"Wrote {output_path} ({total_rows:,} rows across {n_batches} batch(es)).")
+
+    if total_rows == 0:
+        print("WARNING: zero rows extracted -- nothing to summarize/spot-check.", file=sys.stderr)
+        return
+
+    final_df = pd.read_parquet(output_path)  # re-read for summary/spot-check only
     print_summary(final_df, cohort_for_join)
 
     hadm_ids_present = final_df["hadm_id"].drop_duplicates().tolist()

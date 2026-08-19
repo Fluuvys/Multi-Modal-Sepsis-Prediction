@@ -4,7 +4,8 @@ data/cohort/*
 data/raw_links/*.env
 *.parquet
 *.csv
-
+*.jpg
+*.png
 # python
 __pycache__/
 *.pyc
