@@ -69,6 +69,7 @@ if str(REPO_ROOT) not in sys.path:
 from dataset import SepsisDataset, collate_sepsis_batch, VARIABLE_VOCAB
 from evaluate import evaluate_both_protocols, compute_metrics
 from models.baselines.utde import UTDEBaseline
+from models.baselines.fusemoe import FuseMoEBaseline
 
 
 # --------------------------------------------------------------------------------------
@@ -128,13 +129,16 @@ def _build_mult_cross_ts(config: dict, device: str):
 def _build_utde(config: dict, device: str):
     return UTDEBaseline(config, device)
 
+def _build_fusemoe(config: dict, device: str):
+    model_args = config.get("model_args", {})
+    return FuseMoEBaseline(device=device, **model_args)
 
 MODEL_REGISTRY = {
     "sanity_baseline": _build_sanity_baseline,
     "mult_cross_ts": _build_mult_cross_ts,
     "utde": _build_utde,
     # "medpatch": ...       # TODO once models/baselines/medpatch.py is implemented
-    # "fusemoe": ...
+    "fusemoe": _build_fusemoe,
     # "drfuse": ...
     # "medfuse": ...
     # "ours": ...           # models/ours/backbone.py + sdca.py + sarl.py
