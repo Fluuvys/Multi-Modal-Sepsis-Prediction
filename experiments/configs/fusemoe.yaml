@@ -1,0 +1,51 @@
+run_tag: fusemoe_ts_notes_cxr
+seed: 1002
+data_dir: F:\Sepsis\Multi-Modal-Sepsis-Prediction\data\cohort
+# /home/fluuvys-main/Research/Multi modal sepsis prediction/Multi-Modal-Sepsis-Prediction/data/cohort
+modalities: [ts, notes, cxr]
+obs_buffer_hours: 5.0
+neg_subsample_ratio: 5.0
+# Smaller than utde.yaml's batch_size: 8 default headroom -- MoE cross-modal fusion
+# (3 modalities x tt_max x embed_dim through TransformerCrossEncoderLayer's MoE) is
+# noticeably heavier than a single-cross-attention model. Raise if your GPU has room.
+batch_size: 8
+lr: 0.001
+epochs: 20
+patience: 4
+eval_bootstrap_n: 1000
+model: fusemoe
+model_args:
+  # -- core FuseMoE / mTAND hyperparams (mirrors utde.yaml's embed_dim/tt_max/layers) --
+  embed_dim: 64
+  embed_time: 16
+  tt_max: 48
+  layers: 2
+  cross_layers: 2
+  num_heads: 8          # embed_dim must be divisible by num_heads (64 / 8 = 8, OK)
+  dropout: 0.1
+  kernel_size: 3
+
+  # -- sparse mixture-of-experts fusion (cross_method='moe' is hardcoded in the adapter) --
+  hidden_size: 128
+  num_of_experts: [4]
+  top_k: [2]
+  router_type: joint          # ASSUMPTION -- confirm against utils/config.py's MoEConfig /
+                               # core/sparse_moe.py's MoE (not available in this project's context);
+                               # adjust if construction raises on an invalid router_type.
+  gating_function: [softmax]  # ASSUMPTION -- same caveat as router_type above.
+
+  # -- project-specific --
+  lookback_hours: 48.0        # normalizes hours-since-admission into [0,1] for the mTAND time grid
+  num_labels: 1                # single-logit binary sepsis-onset head (BCEWithLogitsLoss)
+  text_model_name: emilyalsentzer/Bio_ClinicalBERT
+
+results_dir: ../results
+
+# --------------------------------------------------------------------------------
+# NOTE: this config assumes batch["notes"]["emb"] (precomputed 768-dim note
+# embeddings) and batch["cxr"]["feats"] (precomputed 1024-dim CXR embeddings) are
+# available on every batch -- collate_sepsis_batch in dataset.py does not produce
+# these today (it keeps notes/CXR as raw text / image paths by design). See the
+# FuseMoEBaseline class docstring's "EXPECTED batch DICT KEYS" section for the
+# full key list and what needs to be added upstream before this config can run.
+# --------------------------------------------------------------------------------
