@@ -69,6 +69,7 @@ if str(REPO_ROOT) not in sys.path:
 from dataset import SepsisDataset, collate_sepsis_batch, VARIABLE_VOCAB
 from evaluate import evaluate_both_protocols, compute_metrics
 from models.baselines.utde import UTDEBaseline
+from models.baselines.medfuse import MedFuseBaseline
 
 
 # --------------------------------------------------------------------------------------
@@ -121,13 +122,15 @@ def _build_sanity_baseline(config: dict, device: str):
 def _build_mult_cross_ts(config: dict, device: str):
     return MultCrossTSBaseline(config, device)
 
-
 # Every entry is a (config, device) -> nn.Module builder, so each model can take
 # whatever constructor args it actually needs (a bare nn.Module vs. one that wants the
 # full config dict + device, like MultCrossTSBaseline) without train.py caring which.
 def _build_utde(config: dict, device: str):
     return UTDEBaseline(config, device)
 
+def _build_medfuse(config: dict, device: str):
+    model_args = config.get("model_args", {})
+    return MedFuseBaseline(device=device, **model_args)
 
 MODEL_REGISTRY = {
     "sanity_baseline": _build_sanity_baseline,
@@ -136,7 +139,7 @@ MODEL_REGISTRY = {
     # "medpatch": ...       # TODO once models/baselines/medpatch.py is implemented
     # "fusemoe": ...
     # "drfuse": ...
-    # "medfuse": ...
+    "medfuse":_build_medfuse,
     # "ours": ...           # models/ours/backbone.py + sdca.py + sarl.py
 }
 
