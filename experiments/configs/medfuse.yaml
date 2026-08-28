@@ -1,0 +1,45 @@
+# experiments/configs/medfuse.yaml
+# Milestone 3 -- baseline reproduction: MedFuse (LSTM fusion, TS+CXR only).
+#
+# NOTE (read before running):
+# 1. `model: medfuse` is not yet wired into train.py's MODEL_REGISTRY -- add a
+#    builder there (mirroring `_build_fusemoe`) that constructs
+#    MedFuseBaseline(**config["model_args"], device=device) before this config
+#    can actually be used with train.py.
+# 2. modalities is [ts, cxr] only -- MedFuse's original architecture has no
+#    notes pathway (see PROJECT_CONTEXT.md's related-work table), so `notes`
+#    is intentionally omitted here, unlike the utde example config.
+# 3. dataset.py's collate_sepsis_batch() does not yet emit the dense, hourly-
+#    binned (B, T, 76) EHR tensor or preloaded/resized CXR tensors this
+#    adapter expects -- see the "ASSUMPTIONS" section of the MedFuseBaseline
+#    docstring in models/baselines/medfuse.py. A MedFuse-specific transform/
+#    collate step is still needed upstream of this config.
+
+run_tag: medfuse_ts_cxr
+seed: 1002
+data_dir: F:\Sepsis\Multi-Modal-Sepsis-Prediction\data\cohort
+# /home/fluuvys-main/Research/Multi modal sepsis prediction/Multi-Modal-Sepsis-Prediction/data/cohort
+modalities: [ts, cxr]
+obs_buffer_hours: 5.0
+neg_subsample_ratio: 5.0
+batch_size: 8          # keep >= 2 -- see docstring point 5 (ht.squeeze() batch-collapse quirk)
+lr: 0.001
+epochs: 20
+patience: 4
+eval_bootstrap_n: 1000
+model: medfuse
+model_args:
+  # --- EHR (LSTM) encoder ---
+  ehr_input_dim: 17        # MIMIC-III benchmark-style hourly featurization; ASSUMPTION, confirm against your binning step
+  ehr_hidden_dim: 128
+  ehr_layers: 1
+  ehr_dropout: 0.0
+  # --- CXR (vision) encoder ---
+  vision_backbone: resnet50
+  pretrained: true
+  vision_num_classes: 14   # unused by the 'lstm' fusion path, kept only because CXRModels requires the attribute
+  img_size: 224            # for your upstream image-loading transform; not consumed by the adapter itself
+  # --- task / fusion ---
+  num_classes: 1
+  fusion_type: lstm         # fixed -- this is what makes it "MedFuse" vs. the other fusion_type branches in Fusion
+results_dir: ../results
