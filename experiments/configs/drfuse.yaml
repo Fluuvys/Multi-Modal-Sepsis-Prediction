@@ -1,0 +1,42 @@
+run_tag: drfuse_ts_cxr_lead6h
+seed: 1002
+data_dir: D:\WORKSPACE\ALL_MY_PRJ\Sepsis\code\multimodal_sepsis\Multi-Modal-Sepsis-Prediction\data\cohort
+modalities: [ts, cxr]   # DrFuse is TS+CXR only -- see drfuse.py's module docstring
+                        # CAVEAT; do not add notes here, DrFuseBaseline raises if you do
+obs_buffer_hours: 5.0
+neg_subsample_ratio: 5.0
+batch_size: 8
+lr: 0.001
+epochs: 20
+patience: 4
+eval_bootstrap_n: 1000
+model: drfuse
+model_args:
+  hidden_size: 128
+  ehr_n_head: 4
+  ehr_n_layers: 1
+  ehr_dropout: 0.3
+  lookback_hours: 48       # hourly bins fed to EHRTransformer after discretization,
+                            # counted backward from each sample's own t_hours.
+                            # ASSUMPTION (per drfuse.py): matches the original
+                            # MIMIC-III-benchmark-style 48h window, not retuned here
+  cxr_image_size: 224      # resnet50 input side length
+  # NOTE: removed the `lead_hours` key that used to be here -- confirmed via
+  # train.py that SepsisDataset(...) in main() takes no lead_hours/horizon
+  # argument at all, so it did nothing. Check dataset.py's SepsisDataset
+  # constructor for how the 2h/4h/6h/12h sweep is actually parameterized
+  # (a separate sepsis_labels.parquet per lead time swapped via data_dir? a
+  # constructor arg train.py doesn't expose yet?) before assuming this run
+  # targets a specific lead time -- run_tag below is currently just a label,
+  # not something that changes what gets trained.
+  # ASSUMPTION (per drfuse.py): lambda_* weights below are untuned for binary
+  # Sepsis-3 -- the original DrFuse repo tuned these for a 25-label multilabel
+  # task. Left at 1.0 as a neutral starting point; sweep against val AUPRC.
+  lambda_pred_ehr: 1.0
+  lambda_pred_cxr: 1.0
+  lambda_pred_shared: 1.0
+  lambda_disentangle_shared: 1.0
+  lambda_disentangle_ehr: 1.0
+  lambda_disentangle_cxr: 1.0
+  lambda_attn_aux: 1.0
+results_dir: ../results
