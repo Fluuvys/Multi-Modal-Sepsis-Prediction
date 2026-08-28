@@ -69,7 +69,12 @@ if str(REPO_ROOT) not in sys.path:
 from dataset import SepsisDataset, collate_sepsis_batch, VARIABLE_VOCAB
 from evaluate import evaluate_both_protocols, compute_metrics
 from models.baselines.utde import UTDEBaseline
+<<<<<<< HEAD
 
+=======
+from models.baselines.drfuse import DrFuseBaseline
+from models.baselines.medpatch import MedPatchBaseline
+>>>>>>> 21bbd3d (add medpatch.py add medpatch.yaml, add medpatch in train.py)
 
 # --------------------------------------------------------------------------------------
 # Placeholder model -- see module docstring. Delete/replace once real models exist.
@@ -128,12 +133,21 @@ def _build_mult_cross_ts(config: dict, device: str):
 def _build_utde(config: dict, device: str):
     return UTDEBaseline(config, device)
 
+<<<<<<< HEAD
+=======
+def _build_drfuse(config: dict, device: str):
+    return DrFuseBaseline(config, device)
+
+def _build_medpatch(config: dict, device: str):
+    return MedPatchBaseline(config, device)
+
+>>>>>>> 21bbd3d (add medpatch.py add medpatch.yaml, add medpatch in train.py)
 
 MODEL_REGISTRY = {
     "sanity_baseline": _build_sanity_baseline,
     "mult_cross_ts": _build_mult_cross_ts,
     "utde": _build_utde,
-    # "medpatch": ...       # TODO once models/baselines/medpatch.py is implemented
+    "medpatch": _build_medpatch,
     # "fusemoe": ...
     # "drfuse": ...
     # "medfuse": ...
