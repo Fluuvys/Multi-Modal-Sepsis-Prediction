@@ -1,0 +1,79 @@
+# MedPatch baseline config -- see models/baselines/medpatch.py for the
+# full module docstring / ASSUMPTIONS section.
+#
+# NOTE: `model: medpatch` is NOT yet registered in `experiments/train.py`'s
+# MODEL_REGISTRY (see `NOT-WIRED NOTE` in medpatch.py). Running this config
+# today will raise `ValueError: Unknown model 'medpatch'` from train.py:238.
+# Wiring it is a small additive change in train.py:
+#     1. import:  from models.baselines.medpatch import MedPatchBaseline
+#     2. builder: MODEL_REGISTRY["medpatch"] = lambda cfg, dev: MedPatchBaseline(cfg, dev)
+#     3. (no other line changes)
+
+model: medpatch
+
+data_dir: data/cohort
+
+# Tri-modal capable, bi-modal default. Uncomment `cxr` to enable once
+# `data/cohort/cxr_metadata.parquet` has rows; the model degrades gracefully
+# (zeroed images + pairs=0) if no paths are present, but turning the line on
+# while linking is incomplete just trains on all-zero CXR, which is wasted
+# compute. See the CAVEAT in medpatch.py's module docstring.
+modalities:
+  - ts
+  - notes
+  # - cxr
+
+# Predict at each hour t for sepsis onset within the next 4 hours
+# (PROJECT_CONTEXT.md §7). obs_buffer_hours guards against using the
+# future as a feature.
+horizon_hours: 4
+obs_buffer_hours: 5.0
+
+# Pre-suspicion evaluation is enforced by the evaluator, not by the
+# sampling logic -- SepsisDataset already windows per PROJECT_CONTEXT.md
+# §4. Flag here is documentation, not something the dataset reads.
+pre_suspicion_eval: true
+
+# Neg/pos subsampling ratio for training. Kept the same as drfuse.yaml.
+neg_subsample_ratio: 5.0
+
+# Run label -- not read by the model or dataset. `lead_hours` from
+# MedPatch's arguments.py is intentionally absent here because
+# SepsisDataset takes no such argument (drfuse.yaml:24-31 raises the same
+# warning about that key being dead in our setup).
+run_tag: medpatch_baseline
+
+# Batch + epochs match drfuse.yaml so the comparison is apples-to-apples.
+batch_size: 64
+epochs: 50
+learning_rate: 0.0001
+weight_decay: 0.0
+patience: 10
+
+# All thresholds/defaults mirror the relevant subset of
+# MedPatch/arguments.py (lines 109-115). See DEFAULT_MODEL_ARGS in
+# medpatch.py for the same numbers, with rationale.
+model_args:
+  hidden_size: 128
+  lookback_hours: 48
+  max_notes: 4
+  max_note_tokens: 512
+  note_vocab_size: 20000
+  cxr_image_size: 224
+  cxr_patch_size: 16
+  ts_confidence_threshold: 0.3
+  cxr_confidence_threshold: 0.3
+  notes_confidence_threshold: 0.3
+  weight_high: 1.0
+  weight_low: 1.0
+  weight_late: 1.0
+  ablation: null  # one of: null, "without_joint_module", "without_missingness_module", "without_late_module"
+
+# Auxiliary-loss weighting -- see drfuse.py's KNOWN LIMITATION for why
+# this is wired but not currently used by train.py: the primary BCE on
+# `late_logit` is what train.py backprops today. The auxiliary terms
+# appear on `last_loss_aux` for logging. Bump this if/when train.py is
+# patched to add the aux loss back into the backward pass.
+lambda_aux: 1.0
+
+seed: 42
